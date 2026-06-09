@@ -26,6 +26,7 @@ from functools import partial
 import tokenspeed_kernel
 import torch
 import triton.language as tl
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.triton_config import (
@@ -33,6 +34,8 @@ from tokenspeed.runtime.layers.moe.backends.triton_config import (
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.utils.env import envs
+
+_IS_AMD = current_platform().is_amd
 
 __all__ = [
     "support_tensor_descriptor",
@@ -215,9 +218,18 @@ def triton_forward(
 
     out_hidden_states = torch.empty_like(hidden_states)
     # Current limitation: Should avoid using runtime shapes as traits
-    expected_combine_kernel = (
-        "torch_compile_moe_sum_reduce" if m_tokens <= 32 else "triton_moe_sum_reduce"
-    )
+    if _IS_AMD:
+        # The torch.compile (inductor) combine path aborts under concurrent
+        # per-rank inductor compile workers on AMD ("Fatal Python error: Aborted"
+        # in _inductor/compile_worker). Use the hand-written Triton combine, which
+        # has no torch.compile dependency, regardless of token count.
+        expected_combine_kernel = "triton_moe_sum_reduce"
+    else:
+        expected_combine_kernel = (
+            "torch_compile_moe_sum_reduce"
+            if m_tokens <= 32
+            else "triton_moe_sum_reduce"
+        )
     routed_scaling_factor = 1.0
     tokenspeed_kernel.moe_combine(
         intermediate_cache3,
