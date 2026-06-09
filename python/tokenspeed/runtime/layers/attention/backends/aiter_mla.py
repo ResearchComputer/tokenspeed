@@ -202,8 +202,12 @@ class AiterMLABackend(AttentionBackend):
                        bs, save_kv_cache=True, **kwargs):
         # KV is written by the model (aiter_mla is in _MLA_KERNEL_BACKENDS); the
         # backend only reads. Guard kept for completeness.
-        if save_kv_cache and k is not None:
-            token_to_kv_pool.set_kv_buffer(layer, out_cache_loc, k, v)
+        # aiter_mla is in DeepseekV3AttentionMLA._MLA_KERNEL_BACKENDS, so the
+        # model writes the latent KV (set_mla_kv_buffer) and passes
+        # save_kv_cache=False. The backend only reads the cache.
+        assert not (save_kv_cache and k is not None), (
+            "AiterMLABackend expects model-owned KV writes (save_kv_cache=False)"
+        )
 
         md = self.forward_decode_metadata
         q = q.view(-1, self.num_q_heads, self.kv_cache_dim)
@@ -234,6 +238,11 @@ class AiterMLABackend(AttentionBackend):
         lse is consumed by the model's ``merge_state`` only when cached-prefix
         chunks exist (disabled in v1 via ``--no-enable-prefix-caching``).
         """
+        if logits_soft_cap:
+            raise NotImplementedError(
+                "AiterMLABackend: non-zero logits_soft_cap is not supported by "
+                "aiter.flash_attn_varlen_func."
+            )
         head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         result = kops.flash_attn_varlen_func(
             q.view(-1, self.num_local_heads, head_dim),
@@ -252,7 +261,10 @@ class AiterMLABackend(AttentionBackend):
         if out is not None and output is not out:
             out.copy_(output.view(out.shape))
             output = out
-        return output, lse
+        # flash_attn_varlen_func returns lse as [num_heads, total_q]; merge_state
+        # (used in the cached-prefix chunk loop) expects [total_q, num_heads],
+        # matching FlashMLABackend.forward_extend_chunked.
+        return output, (lse.T.contiguous() if lse is not None else None)
 
     def forward_extend(self, q, k, v, layer, out_cache_loc, token_to_kv_pool,
                        bs, save_kv_cache=True, **kwargs):
