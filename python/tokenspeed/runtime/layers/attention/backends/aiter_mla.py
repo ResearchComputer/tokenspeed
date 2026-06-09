@@ -45,7 +45,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-
 from tokenspeed_kernel.ops.attention import aiter_mla as kops
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -64,8 +63,8 @@ if TYPE_CHECKING:
 class AiterMLADecodeMetadata:
     """Paged latent-KV metadata for an absorbed decode pass."""
 
-    kv_indptr: torch.Tensor          # [bs+1] int32, cumsum of pages per request
-    kv_indices: torch.Tensor         # [total_pages] int32, page ids per request
+    kv_indptr: torch.Tensor  # [bs+1] int32, cumsum of pages per request
+    kv_indices: torch.Tensor  # [total_pages] int32, page ids per request
     kv_last_page_lens: torch.Tensor  # [bs]   int32, fill of each request's last page
 
 
@@ -126,9 +125,17 @@ class AiterMLABackend(AttentionBackend):
         kv_last_page_lens = ((seq_lens - 1) % self.page_size + 1).to(torch.int32)
         return kv_indptr, kv_indices, kv_last_page_lens
 
-    def init_forward_metadata(self, bs, num_extends, req_pool_indices, seq_lens,
-                              forward_mode, req_to_page=None,
-                              extend_prefix_lens=None, **kwargs):
+    def init_forward_metadata(
+        self,
+        bs,
+        num_extends,
+        req_pool_indices,
+        seq_lens,
+        forward_mode,
+        req_to_page=None,
+        extend_prefix_lens=None,
+        **kwargs,
+    ):
         if forward_mode.is_extend_or_mixed():
             n = num_extends
             extend_seq_lens = kwargs.pop("extend_seq_lens")
@@ -164,16 +171,16 @@ class AiterMLABackend(AttentionBackend):
             )
         if forward_mode.is_decode_or_idle() or forward_mode.is_mixed():
             kv_indptr, kv_indices, kv_last = self._build_kv_paging(
-                req_pool_indices[:bs], seq_lens[:bs], req_to_page)
+                req_pool_indices[:bs], seq_lens[:bs], req_to_page
+            )
             self.forward_decode_metadata = AiterMLADecodeMetadata(
-                kv_indptr=kv_indptr, kv_indices=kv_indices,
-                kv_last_page_lens=kv_last)
+                kv_indptr=kv_indptr, kv_indices=kv_indices, kv_last_page_lens=kv_last
+            )
 
     # ------------------------------------------------------------------
     # CUDA/HIP graph: not supported in v1 (eager only)
     # ------------------------------------------------------------------
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor,
-                              **kwargs):
+    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor, **kwargs):
         # The wrapper always calls this in __init__, but skips capture() when
         # config.enforce_eager is set. v1 is eager-only, so no graph buffers are
         # allocated here; the capture/replay hooks below are never reached under
@@ -198,40 +205,73 @@ class AiterMLABackend(AttentionBackend):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-    def forward_decode(self, q, k, v, layer, out_cache_loc, token_to_kv_pool,
-                       bs, save_kv_cache=True, **kwargs):
+    def forward_decode(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        out_cache_loc,
+        token_to_kv_pool,
+        bs,
+        save_kv_cache=True,
+        **kwargs,
+    ):
         # KV is written by the model (aiter_mla is in _MLA_KERNEL_BACKENDS); the
         # backend only reads. Guard kept for completeness.
         # aiter_mla is in DeepseekV3AttentionMLA._MLA_KERNEL_BACKENDS, so the
         # model writes the latent KV (set_mla_kv_buffer) and passes
         # save_kv_cache=False. The backend only reads the cache.
-        assert not (save_kv_cache and k is not None), (
-            "AiterMLABackend expects model-owned KV writes (save_kv_cache=False)"
-        )
+        assert not (
+            save_kv_cache and k is not None
+        ), "AiterMLABackend expects model-owned KV writes (save_kv_cache=False)"
 
         md = self.forward_decode_metadata
         q = q.view(-1, self.num_q_heads, self.kv_cache_dim)
         total_q = q.shape[0]
         q_len_per_req = total_q // bs if bs > 0 else 1
         qo_indptr = torch.arange(
-            0, total_q + 1, q_len_per_req, dtype=torch.int32, device=q.device)
+            0, total_q + 1, q_len_per_req, dtype=torch.int32, device=q.device
+        )
 
         # MLA latent pool [N, 1, kv_cache_dim] viewed as 4-D pages for the kernel.
         kv_buffer = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-            -1, self.page_size, 1, self.kv_cache_dim)
-        o = torch.empty(total_q, self.num_q_heads, self.kv_lora_rank,
-                        dtype=q.dtype, device=q.device)
+            -1, self.page_size, 1, self.kv_cache_dim
+        )
+        o = torch.empty(
+            total_q, self.num_q_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+        )
         kops.mla_decode_fwd(
-            q, kv_buffer, o, qo_indptr, md.kv_indptr, md.kv_indices,
-            md.kv_last_page_lens, max_seqlen_q=q_len_per_req,
-            page_size=self.page_size, sm_scale=layer.scaling,
+            q,
+            kv_buffer,
+            o,
+            qo_indptr,
+            md.kv_indptr,
+            md.kv_indices,
+            md.kv_last_page_lens,
+            max_seqlen_q=q_len_per_req,
+            page_size=self.page_size,
+            sm_scale=layer.scaling,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def forward_extend_chunked(self, q, k, v, scaling, logits_soft_cap=None, *,
-                               cum_seq_lens_q, cum_seq_lens_kv, max_q_len,
-                               max_kv_len, seq_lens, batch_size, causal,
-                               out=None):
+    def forward_extend_chunked(
+        self,
+        q,
+        k,
+        v,
+        scaling,
+        logits_soft_cap=None,
+        *,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        max_q_len,
+        max_kv_len,
+        seq_lens,
+        batch_size,
+        causal,
+        out=None,
+    ):
         """Full-MHA ragged attention over decompressed q/k/v (prefill).
 
         Returns ``(output, lse)``; ``out`` (when given) receives the output. The
@@ -257,7 +297,9 @@ class AiterMLABackend(AttentionBackend):
             return_lse=True,
             out=out,
         )
-        output, lse = (result[0], result[1]) if isinstance(result, tuple) else (result, None)
+        output, lse = (
+            (result[0], result[1]) if isinstance(result, tuple) else (result, None)
+        )
         if out is not None and output is not out:
             out.copy_(output.view(out.shape))
             output = out
@@ -266,8 +308,18 @@ class AiterMLABackend(AttentionBackend):
         # matching FlashMLABackend.forward_extend_chunked.
         return output, (lse.T.contiguous() if lse is not None else None)
 
-    def forward_extend(self, q, k, v, layer, out_cache_loc, token_to_kv_pool,
-                       bs, save_kv_cache=True, **kwargs):
+    def forward_extend(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        out_cache_loc,
+        token_to_kv_pool,
+        bs,
+        save_kv_cache=True,
+        **kwargs,
+    ):
         # DeepSeek MLA drives prefill through forward_extend_chunked, not this
         # path. (Plain ragged extend / spec-decode verify is a v2 concern.)
         raise NotImplementedError(

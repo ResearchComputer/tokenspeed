@@ -40,8 +40,10 @@ if not _is_amd:
         silu_and_mul,
     )
 else:
-    def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None,
-                     enable_pdl: bool = False) -> torch.Tensor:
+
+    def silu_and_mul(
+        x: torch.Tensor, out: torch.Tensor | None = None, enable_pdl: bool = False
+    ) -> torch.Tensor:
         """SiLU-gated activation: ``silu(x[..., :d]) * x[..., d:]``.
 
         Pure-torch AMD fallback for the kernel exposed on NVIDIA, so callers
@@ -54,6 +56,7 @@ else:
             out.copy_(result)
             return out
         return result
+
 
 logger = get_colorful_logger(__name__)
 

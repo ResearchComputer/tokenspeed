@@ -75,12 +75,20 @@ def test_mla_decode_matches_reference():
     kv_last_page_lens = torch.ones(B, device=dev, dtype=torch.int32)
 
     kops.mla_decode_fwd(
-        q, kv_buffer, o, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens,
-        max_seqlen_q=1, page_size=page, sm_scale=sm_scale,
+        q,
+        kv_buffer,
+        o,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        max_seqlen_q=1,
+        page_size=page,
+        sm_scale=sm_scale,
     )
     torch.cuda.synchronize()
 
-    kv_per_req = [kv_buffer[i * S:(i + 1) * S, 0, 0, :] for i in range(B)]
+    kv_per_req = [kv_buffer[i * S : (i + 1) * S, 0, 0, :] for i in range(B)]
     ref = _ref_mla_decode(q, kv_per_req, sm_scale)
     torch.testing.assert_close(o.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
@@ -101,7 +109,15 @@ def test_flash_attn_varlen_causal_matches_reference():
     cu = torch.arange(0, (B + 1) * L, L, device=dev, dtype=torch.int32)
 
     out = kops.flash_attn_varlen_func(
-        q, k, v, cu, cu, L, L, softmax_scale=sm_scale, causal=True,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        L,
+        L,
+        softmax_scale=sm_scale,
+        causal=True,
     )
     out = out[0] if isinstance(out, tuple) else out
     torch.cuda.synchronize()
@@ -109,9 +125,9 @@ def test_flash_attn_varlen_causal_matches_reference():
     # Reference: per-request causal MHA.
     refs = []
     for i in range(B):
-        qi = q[i * L:(i + 1) * L].float().transpose(0, 1)  # [H,L,d]
-        ki = k[i * L:(i + 1) * L].float().transpose(0, 1)
-        vi = v[i * L:(i + 1) * L].float().transpose(0, 1)
+        qi = q[i * L : (i + 1) * L].float().transpose(0, 1)  # [H,L,d]
+        ki = k[i * L : (i + 1) * L].float().transpose(0, 1)
+        vi = v[i * L : (i + 1) * L].float().transpose(0, 1)
         s = torch.matmul(qi, ki.transpose(-1, -2)) * sm_scale  # [H,L,L]
         mask = torch.ones(L, L, dtype=torch.bool, device=dev).tril()
         s = s.masked_fill(~mask, float("-inf"))
