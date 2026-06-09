@@ -29,9 +29,10 @@ Mirrors the NVIDIA ``FlashMLABackend`` integration on AMD CDNA3/CDNA4
   via AITER ``flash_attn_varlen_func`` (the model's chunked-prefill core merges
   cached-prefix chunks with ``merge_state``).
 
-``aiter_mla`` is registered in ``DeepseekV3AttentionMLA._MLA_KERNEL_BACKENDS`` so
-the model writes the KV cache (``set_mla_kv_buffer``) and produces the absorbed
-decode query; the backend therefore only reads the cache.
+Like the NVIDIA ``FlashMLABackend``, ``aiter_mla`` is selected as the AMD default
+(not in ``_MLA_KERNEL_BACKENDS``): the model produces the absorbed decode query
+and writes the prefill KV, while the backend writes the decode KV itself
+(``set_kv_buffer`` when ``save_kv_cache=True``).
 
 v1 constraints (docs/superpowers/specs/2026-06-09-aiter-mla-backend-design.md):
 - eager only — CUDA/HIP-graph capture unsupported; run with ``--enforce-eager``.
@@ -217,14 +218,12 @@ class AiterMLABackend(AttentionBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        # KV is written by the model (aiter_mla is in _MLA_KERNEL_BACKENDS); the
-        # backend only reads. Guard kept for completeness.
-        # aiter_mla is in DeepseekV3AttentionMLA._MLA_KERNEL_BACKENDS, so the
-        # model writes the latent KV (set_mla_kv_buffer) and passes
-        # save_kv_cache=False. The backend only reads the cache.
-        assert not (
-            save_kv_cache and k is not None
-        ), "AiterMLABackend expects model-owned KV writes (save_kv_cache=False)"
+        # aiter_mla is the AMD default (not in _MLA_KERNEL_BACKENDS), so — like
+        # FlashMLABackend — the model passes save_kv_cache=True and the backend
+        # writes the latent KV before reading it. (Prefill KV is written by the
+        # model in forward_normal_chunked, independent of this flag.)
+        if save_kv_cache and k is not None:
+            token_to_kv_pool.set_kv_buffer(layer, out_cache_loc, k, v)
 
         md = self.forward_decode_metadata
         q = q.view(-1, self.num_q_heads, self.kv_cache_dim)

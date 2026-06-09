@@ -448,7 +448,9 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
 class DeepseekV3AttentionMLA(nn.Module):
     # Backends where the model owns the KV write (set_mla_kv_buffer) and produces
     # the absorbed decode query; the backend reads the paged latent cache.
-    _MLA_KERNEL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "aiter_mla")
+    # (aiter_mla follows the flashmla pattern instead: it is the AMD default and
+    # writes its own decode KV via set_kv_buffer, so it is intentionally not here.)
+    _MLA_KERNEL_BACKENDS = ("trtllm_mla", "tokenspeed_mla")
     # Backends that support chunked ragged prefill with prefix replay.
     _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla")
 
