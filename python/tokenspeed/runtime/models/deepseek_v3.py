@@ -446,8 +446,9 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
 
 
 class DeepseekV3AttentionMLA(nn.Module):
-    # Backends that use non-absorbed MLA kernels (ragged prefill, paged KV decode).
-    _MLA_KERNEL_BACKENDS = ("trtllm_mla", "tokenspeed_mla")
+    # Backends where the model owns the KV write (set_mla_kv_buffer) and produces
+    # the absorbed decode query; the backend reads the paged latent cache.
+    _MLA_KERNEL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "aiter_mla")
     # Backends that support chunked ragged prefill with prefix replay.
     _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla")
 
@@ -1992,7 +1993,18 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         torch.cuda.synchronize()
 
 
+class DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
+    """DeepSeek-V2 (e.g. DeepSeek-V2-Lite) reuses the V3 MLA + MoE implementation.
+
+    HF V2 checkpoints advertise ``architectures = ["DeepseekV2ForCausalLM"]``; the
+    attention/MoE code reads its dimensions from the config (``kv_lora_rank``,
+    ``q_lora_rank``, expert counts, …) so the same module serves both. Registered
+    so V2 architectures resolve to this implementation.
+    """
+
+
 EntryClass = [
     DeepseekV3ForCausalLM,
+    DeepseekV2ForCausalLM,
     Eagle3DeepseekV2ForCausalLM,
 ]
