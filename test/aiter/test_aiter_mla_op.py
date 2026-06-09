@@ -85,6 +85,42 @@ def test_mla_decode_matches_reference():
     torch.testing.assert_close(o.float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
+def test_flash_attn_varlen_causal_matches_reference():
+    """Prefill uses full-MHA flash_attn_varlen_func (decompressed q/k/v)."""
+    assert kops.is_available()
+    dev, dt = "cuda", torch.bfloat16
+    torch.manual_seed(0)
+    B, H, qk_head_dim, v_head_dim = 2, 16, 192, 128  # DeepSeek MLA prefill dims
+    L = 8  # prompt length per request (no prefix -> causal self-attention)
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+    total = B * L
+
+    q = torch.randn(total, H, qk_head_dim, device=dev, dtype=dt)
+    k = torch.randn(total, H, qk_head_dim, device=dev, dtype=dt)
+    v = torch.randn(total, H, v_head_dim, device=dev, dtype=dt)
+    cu = torch.arange(0, (B + 1) * L, L, device=dev, dtype=torch.int32)
+
+    out = kops.flash_attn_varlen_func(
+        q, k, v, cu, cu, L, L, softmax_scale=sm_scale, causal=True,
+    )
+    out = out[0] if isinstance(out, tuple) else out
+    torch.cuda.synchronize()
+
+    # Reference: per-request causal MHA.
+    refs = []
+    for i in range(B):
+        qi = q[i * L:(i + 1) * L].float().transpose(0, 1)  # [H,L,d]
+        ki = k[i * L:(i + 1) * L].float().transpose(0, 1)
+        vi = v[i * L:(i + 1) * L].float().transpose(0, 1)
+        s = torch.matmul(qi, ki.transpose(-1, -2)) * sm_scale  # [H,L,L]
+        mask = torch.ones(L, L, dtype=torch.bool, device=dev).tril()
+        s = s.masked_fill(~mask, float("-inf"))
+        p = torch.softmax(s, dim=-1)
+        refs.append(torch.matmul(p, vi).transpose(0, 1))  # [L,H,d]
+    ref = torch.cat(refs, dim=0)
+    torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
 def test_aiter_mla_registered_on_amd():
     from tokenspeed_kernel.platform import current_platform
 

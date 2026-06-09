@@ -12,7 +12,7 @@ mla_decode_fwd(q, kv_buffer, o, qo_indptr, kv_indptr, kv_indices,
 ```
 
 - `q`: `[total_q, nhead, kv_lora_rank + qk_rope_head_dim]` (absorbed query; `total_q = sum(qo_lens)`, =bs for plain decode).
-- `kv_buffer`: **`[num_page*page_size, 1, kv_lora_rank + qk_rope_head_dim]`** (bf16). This is *exactly* tokenspeed's MLA pool per-layer buffer `(size+page_size, 1, kv_cache_dim)` — pass `token_to_kv_pool.get_key_buffer(layer_id)` directly, **no reshape**.
+- `kv_buffer` (decode): **4-D `[num_page, page_size, nhead_kv=1, kv_lora_rank + qk_rope_head_dim]`** (bf16). `mla.py:186` does `_, _, _, qk_head_dim = kv_buffer.shape`. tokenspeed's MLA pool buffer is 3-D `(size+page_size, 1, kv_cache_dim)`; **view it as `(-1, page_size, 1, kv_cache_dim)`** before the call (exactly what FlashMLA does: `k_cache.view(-1, PAGE_SIZE, 1, kv_cache_dim)`). With `page_size=1` → `[total_tokens, 1, 1, Dq]`.
 - `o`: `[total_q, nhead, kv_lora_rank]` (output is the latent/value dim = kv_lora_rank; the model up-projects afterward).
 - `qo_indptr`: `[bs+1]` int32, cumsum of query lengths (plain decode: `arange(bs+1)`).
 - `kv_indptr`: `[bs+1]` int32, cumsum of **pages per request** = `ceil(seq_len/page_size)`.
