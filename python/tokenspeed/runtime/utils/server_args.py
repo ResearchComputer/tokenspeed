@@ -1268,6 +1268,7 @@ class ServerArgs:
             "trtllm_mla",
             "flashmla",
             "tokenspeed_mla",
+            "aiter_mla",
             "hybrid_linear_attn",
         ]
         parser.add_argument(

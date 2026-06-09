@@ -172,7 +172,21 @@ class AiterMLABackend(AttentionBackend):
     # ------------------------------------------------------------------
     # CUDA/HIP graph: not supported in v1 (eager only)
     # ------------------------------------------------------------------
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
+    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor,
+                              **kwargs):
+        # The wrapper always calls this in __init__, but skips capture() when
+        # config.enforce_eager is set. v1 is eager-only, so no graph buffers are
+        # allocated here; the capture/replay hooks below are never reached under
+        # --enforce-eager. (HIP-graph capture is a v2 feature.)
+        return
+
+    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
+        raise NotImplementedError(
+            "AiterMLABackend v1 is eager-only; launch the server with "
+            "--enforce-eager (HIP-graph capture is planned for v2)."
+        )
+
+    def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
         raise NotImplementedError(
             "AiterMLABackend v1 is eager-only; launch the server with "
             "--enforce-eager (HIP-graph capture is planned for v2)."

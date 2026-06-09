@@ -622,10 +622,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
-
-        # Re-dispatch
-        if _is_amd:
-            self._forward_method = self.forward_native
+        # forward() below already dispatches per-platform (fused on NVIDIA,
+        # pure-torch otherwise); there is no _forward_method indirection here.
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
