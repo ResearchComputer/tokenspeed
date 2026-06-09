@@ -55,7 +55,7 @@ _AUTO_IMPL_PREFERENCE = {
         "triton",
     ),
     "w8a8_fp8": ("triton",),
-    "wna16": ("marlin",),
+    "wna16": ("marlin", "triton_dequant"),
 }
 
 
@@ -118,6 +118,13 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
                 impl
                 for impl in auto_candidates
                 if impl in {"gluon_kernel", "triton_kernel"}
+            )
+        elif quant_kind == "wna16":
+            # Marlin is NVIDIA-only; AMD serves W4A16 experts via dequant-on-load
+            # to bf16 (wna16/triton_dequant). The in-kernel INT4 path can be added
+            # here later as a preferred candidate.
+            auto_candidates = tuple(
+                impl for impl in auto_candidates if impl == "triton_dequant"
             )
 
     if not backend.is_auto():

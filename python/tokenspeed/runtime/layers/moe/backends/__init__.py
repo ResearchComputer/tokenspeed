@@ -77,6 +77,10 @@ _BACKEND_SPECS = {
         "tokenspeed.runtime.layers.moe.backends.wna16.marlin",
         "Wna16MarlinBackend",
     ),
+    ("wna16", "triton_dequant"): (
+        "tokenspeed.runtime.layers.moe.backends.wna16.triton_dequant",
+        "Wna16DequantBackend",
+    ),
 }
 _REGISTERED = set()
 
