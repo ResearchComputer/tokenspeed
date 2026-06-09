@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
 )
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.trtllm import (
@@ -1053,6 +1054,7 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     },
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
 )
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
@@ -1126,4 +1128,77 @@ def moe_align_block_size(
         fuse_sorted_ids_padding,
     )
 
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+@register_kernel(
+    "moe",
+    "dispatch",
+    name="amd_moe_align_block_size",
+    solution="triton",
+    signatures=format_signatures("indices", "dense", {torch.int32}),
+    traits={
+        "comm_strategy": frozenset({"local"}),
+    },
+    priority=Priority.PERFORMANT + 2,
+    tags={"portability"},
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+)
+def moe_align_block_size_amd(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """AMD torch implementation of moe_align_block_size.
+
+    Produces the same ``(sorted_token_ids, expert_ids, num_tokens_post_padded)``
+    layout as the trtllm kernel: token-k flat ids (``0..numel-1``) grouped by
+    expert, each expert's run padded up to a multiple of ``block_size`` with
+    ``pad_id = topk_ids.numel()``; the unused tail stays ``pad_id``. Operates on
+    the small routing tensor (correctness-first; a Triton perf kernel is a
+    follow-up). Filtered/EP tokens (expert == ``num_experts``) are dropped
+    (treated as padding) — the single-node bf16 path has none.
+
+    Parameters:
+    - topk_ids: ``[total_tokens, top_k]`` int32 expert indices per token.
+    - block_size: block size for the fused-expert block GEMM.
+    - num_experts: number of routed experts.
+
+    Returns ``(sorted_token_ids, expert_ids, num_tokens_post_padded)`` matching
+    the ``moe/dispatch`` contract consumed by ``invoke_fused_moe_kernel``.
+    """
+    device = topk_ids.device
+    total = topk_ids.numel()
+    pad_id = total
+    max_num_tokens_padded = total + (num_experts + 1) * (block_size - 1)
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
+
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,), pad_id, dtype=torch.int32, device=device
+    )
+    expert_ids = torch.zeros((max_num_m_blocks,), dtype=torch.int32, device=device)
+
+    flat_expert = topk_ids.flatten().to(torch.int64)
+    flat_token = torch.arange(total, device=device, dtype=torch.int32)
+    # Group token ids by expert (stable: within-expert order is deterministic;
+    # canonicalization sorts within blocks anyway).
+    order = torch.argsort(flat_expert, stable=True)
+    tokens_by_expert = flat_token[order]
+    counts = torch.bincount(flat_expert, minlength=num_experts + 1)
+
+    write_pos = 0
+    block_idx = 0
+    offset = 0
+    for e in range(num_experts):  # filtered slot (e == num_experts) is dropped
+        n = int(counts[e].item())
+        grp = tokens_by_expert[offset : offset + n]
+        n_blocks = (n + block_size - 1) // block_size
+        for b in range(n_blocks):
+            cnt = min(block_size, n - b * block_size)
+            start = write_pos + b * block_size
+            sorted_ids[start : start + cnt] = grp[b * block_size : b * block_size + cnt]
+            expert_ids[block_idx + b] = e
+        write_pos += n_blocks * block_size
+        block_idx += n_blocks
+        offset += n
+
+    num_tokens_post_pad = torch.tensor([write_pos], dtype=torch.int32, device=device)
     return sorted_ids, expert_ids, num_tokens_post_pad
