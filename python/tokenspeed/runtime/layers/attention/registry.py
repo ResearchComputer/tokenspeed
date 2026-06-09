@@ -111,6 +111,8 @@ def _get_default_backend_name(arch: AttentionArch) -> str:
             return "trtllm_mla"
         if platform.is_hopper:
             return "flashmla"
+        if platform.is_amd:
+            return "aiter_mla"
         return "trtllm_mla"
     else:
         return "mha"
