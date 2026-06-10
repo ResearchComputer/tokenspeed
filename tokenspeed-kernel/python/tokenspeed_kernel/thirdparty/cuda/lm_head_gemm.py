@@ -36,6 +36,7 @@ from pathlib import Path
 
 import torch
 import tvm_ffi
+from tokenspeed_kernel.platform import current_platform
 
 
 def _objs_dir() -> Path:
@@ -105,6 +106,11 @@ def is_supported(
       * (K, N) = (hidden_dim, vocab_shard) matches a compiled instantiation
       * CC >= 9.0 (Hopper or newer; uses HMMA + cp.async + mbarrier + PDL)
     """
+    # This is a CUDA (.cu) kernel; the .so is never built on AMD. ROCm reports
+    # device.type == "cuda" and gfx942 reports compute capability major == 9, so
+    # the Hopper+ CC gate below would spuriously pass — guard on NVIDIA explicitly.
+    if not current_platform().is_nvidia:
+        return False
     if hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         return False
     if hidden_states.device.type != "cuda" or weight.device.type != "cuda":

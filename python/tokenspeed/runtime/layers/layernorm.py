@@ -411,7 +411,18 @@ class FusedRMSNorm(nn.Module):
             Tuple of (normalized_q_a, normalized_kv_a)
         """
         if _is_amd:
-            raise NotImplementedError("Fused RMSNorm is not implemented on HIP yet")
+            # No fused parallel RMSNorm kernel on HIP. Apply the two RMSNorms
+            # sequentially via the (AMD-supported) triton RMSNorm — numerically
+            # identical to the fused kernel. Honor the same output contract:
+            # write into output_* when given, else normalize the input in place.
+            if output_q_a is not None:
+                output_q_a.copy_(self.q_a_norm(input_q_a))
+            else:
+                self.q_a_norm(input_q_a, inplace=True)
+            if output_kv_a is not None:
+                output_kv_a.copy_(self.kv_a_norm(input_kv_a))
+            else:
+                self.kv_a_norm(input_kv_a, inplace=True)
         else:
             rmsnorm_fused_parallel(
                 input1=input_q_a,
