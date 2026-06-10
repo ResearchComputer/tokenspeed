@@ -1,20 +1,24 @@
-"""Pure-torch reference comm ops (test oracle / default backend).
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ResearchComputer
+"""Flat all-reduce — the correctness oracle for the hierarchical schedule (issue #12).
 
-TODO: add real backends (e.g. NCCL/RCCL custom all-reduce, fused reduce-scatter).
-The reference models the single-process semantics: a sum over the shard list.
+A plain ``dist.all_reduce`` (SUM) over the full group. The hierarchical all-reduce
+must match this bit-for-bit up to floating-point accumulation order.
 """
+
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 
-from ..._backends import Backend
-from ..._dispatch import register
-
-
-def all_reduce_reference(shards: list[torch.Tensor]) -> list[torch.Tensor]:
-    """Sum-allreduce semantics: every shard becomes the elementwise sum."""
-    total = torch.stack(shards, dim=0).sum(dim=0)
-    return [total.clone() for _ in shards]
+__all__ = ["flat_all_reduce"]
 
 
-register("comm", Backend.REFERENCE)(all_reduce_reference)
+def flat_all_reduce(x: torch.Tensor, group=None) -> torch.Tensor:
+    """Sum-reduce ``x`` across all ranks in ``group``; result replicated to all.
+
+    Returns a new tensor (does not modify ``x``).
+    """
+    y = x.clone()
+    dist.all_reduce(y, op=dist.ReduceOp.SUM, group=group)
+    return y

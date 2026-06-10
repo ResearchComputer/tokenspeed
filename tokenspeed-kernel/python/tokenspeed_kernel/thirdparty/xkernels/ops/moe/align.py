@@ -4,14 +4,15 @@
 
 The fused-MoE block GEMM needs tokens grouped by expert with each expert's run
 padded to a multiple of ``block_size``, so every block maps to exactly one
-expert. This exposes the operation as a dispatched op with the correctness-first
-torch reference (``moe_align_block_size_ref``) as the REFERENCE backend.
+expert. This exposes the operation as a dispatched op over the correctness-first
+torch reference (``moe_align_block_size_ref``, REFERENCE) and a Triton perf
+backend (TRITON).
 
-**Status:** reference backend only. A Triton perf kernel (vLLM/SGLang-style:
-per-expert histogram + padded prefix-sum + scatter) is the tracked follow-up for
-issue #4 — it relies on device atomics whose behavior and speedup must be
-validated on real gfx942 hardware, so it is intentionally not landed unverified.
-Until then ``backend="auto"`` resolves to the reference everywhere.
+**Backends:** the REFERENCE is an argsort + per-expert torch padding loop; the
+TRITON backend (``align_kernel.moe_align_block_size_triton``) is the vLLM/SGLang
+-style 4-stage histogram + padded prefix-sum + scatter, validated bit-for-bit
+against the reference (GPU, or CPU under ``TRITON_INTERPRET=1``). ``auto`` picks
+TRITON on GPU vendors and falls back to REFERENCE on CPU-only builds.
 """
 
 from __future__ import annotations
@@ -24,8 +25,9 @@ from .w4a16 import moe_align_block_size_ref
 
 __all__ = ["moe_align_block_size"]
 
-# The reference (in w4a16.py, shared with the INT4 GEMM launcher) is the oracle
-# and the only backend for now.
+# The reference (in w4a16.py, shared with the INT4 GEMM launcher) is the oracle.
+# The TRITON backend (bit-for-bit identical) self-registers from
+# triton/align_kernel.py, imported for its side effect by ops/moe/__init__.py.
 register("moe_align_block_size", Backend.REFERENCE)(moe_align_block_size_ref)
 
 
