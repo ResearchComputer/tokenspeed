@@ -115,6 +115,34 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
 
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        """Return the per-Linear-layer quant method for this config.
+
+        Linear layers in the ``ignore`` list (e.g. attention / dense MLP /
+        ``lm_head`` for an experts-only W4A16 checkpoint) use the unquantized
+        method; matched Linear layers attach their compressed-tensors scheme.
+        MoE layers do not go through this path -- they are routed via the MoE
+        backend selector (``moe/core/selector.py``).
+        """
+        # Lazy imports: ``linear`` imports this module (circular at module load).
+        from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+        from tokenspeed.runtime.layers.linear import LinearBase
+        from tokenspeed.runtime.layers.quantization.utils import (
+            should_ignore_quant_layer,
+        )
+
+        if should_ignore_quant_layer(
+            prefix, self.ignored_layers, self.packed_modules_mapping
+        ):
+            return UnquantizedLinearMethod()
+        if isinstance(layer, LinearBase):
+            scheme = self.get_scheme(layer=layer, layer_name=prefix)
+            if scheme is None:
+                return UnquantizedLinearMethod()
+            layer.scheme = scheme
+            return CompressedTensorsLinearMethod(self)
+        return UnquantizedLinearMethod()
+
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.float16, torch.bfloat16]
 
