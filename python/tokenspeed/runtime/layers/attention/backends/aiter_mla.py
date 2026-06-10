@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""AMD MLA attention backend (ROCm AITER), eager-only v1.
+"""AMD MLA attention backend (ROCm AITER).
 
 Mirrors the NVIDIA ``FlashMLABackend`` integration on AMD CDNA3/CDNA4
 (gfx942/gfx950):
@@ -34,10 +34,16 @@ Like the NVIDIA ``FlashMLABackend``, ``aiter_mla`` is selected as the AMD defaul
 and writes the prefill KV, while the backend writes the decode KV itself
 (``set_kv_buffer`` when ``save_kv_cache=True``).
 
-v1 constraints (docs/superpowers/specs/2026-06-09-aiter-mla-backend-design.md):
-- eager only — CUDA/HIP-graph capture unsupported; run with ``--enforce-eager``.
-- bf16 KV (no fp8); no speculative decode; single node.
-- validated with ``--block-size 1`` (page_size == 1).
+**HIP-graph capture** of the decode path is supported (mirroring FlashMLA): the
+backend keeps its own persistent decode-metadata buffers and refreshes them in
+place before each replay. The AITER ``mla_decode_fwd`` asm kernel reads the
+paged metadata at runtime, so a graph captured at ``seq_len == 1`` replays
+correctly for arbitrary ``seq_lens`` (validated by a capture/replay probe).
+Prefill stays eager (variable length); run decode with graphs (omit
+``--enforce-eager``).
+
+Constraints: bf16 KV (no fp8); no speculative/multi-token decode; validated with
+``--block-size 1`` (page_size == 1).
 """
 
 from __future__ import annotations
@@ -55,6 +61,9 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -96,9 +105,14 @@ class AiterMLABackend(AttentionBackend):
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
         self.num_q_heads = self.num_local_heads
         self.page_size = config.page_size
+        self.max_context_len = config.context_len
 
         self.forward_decode_metadata: AiterMLADecodeMetadata | None = None
         self.chunked_prefill_metadata: AiterChunkedPrefillMetadata | None = None
+        # Persistent HIP-graph decode buffers (allocated in init_cuda_graph_state).
+        self.cuda_graph_kv_indptr: torch.Tensor | None = None
+        self.cuda_graph_kv_indices: torch.Tensor | None = None
+        self.cuda_graph_kv_last_page_lens: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Metadata
@@ -179,26 +193,101 @@ class AiterMLABackend(AttentionBackend):
             )
 
     # ------------------------------------------------------------------
-    # CUDA/HIP graph: not supported in v1 (eager only)
+    # CUDA/HIP graph capture (decode only)
     # ------------------------------------------------------------------
+    # aiter_mla manages its own persistent decode-metadata buffers
+    # (uses_paged_cache_groups stays False, like FlashMLABackend). The wrapper
+    # calls init_cuda_graph_state once, init_forward_metadata_capture_cuda_graph
+    # per captured batch size, and init_forward_metadata_replay_cuda_graph before
+    # every replay. forward_decode reads self.forward_decode_metadata, which the
+    # capture/replay hooks point at these buffers, so it is unchanged between the
+    # eager and graph paths.
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor, **kwargs):
-        # The wrapper always calls this in __init__, but skips capture() when
-        # config.enforce_eager is set. v1 is eager-only, so no graph buffers are
-        # allocated here; the capture/replay hooks below are never reached under
-        # --enforce-eager. (HIP-graph capture is a v2 feature.)
-        return
-
-    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
-        raise NotImplementedError(
-            "AiterMLABackend v1 is eager-only; launch the server with "
-            "--enforce-eager (HIP-graph capture is planned for v2)."
+        device = seq_lens_buf.device
+        # +4 pages of slack per request, matching FlashMLABackend.
+        max_pages = (self.max_context_len + self.page_size - 1) // self.page_size + 4
+        self.cuda_graph_kv_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=device
+        )
+        self.cuda_graph_kv_indices = torch.zeros(
+            max_bs * max_pages, dtype=torch.int32, device=device
+        )
+        self.cuda_graph_kv_last_page_lens = torch.ones(
+            max_bs, dtype=torch.int32, device=device
         )
 
-    def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
-        raise NotImplementedError(
-            "AiterMLABackend v1 is eager-only; launch the server with "
-            "--enforce-eager (HIP-graph capture is planned for v2)."
+    def _set_decode_metadata_from_buffers(self, bs: int) -> None:
+        # kv_indices is the full buffer; the kernel bounds each request by
+        # kv_indptr, so only the freshly written prefix is ever read.
+        self.forward_decode_metadata = AiterMLADecodeMetadata(
+            kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
+            kv_indices=self.cuda_graph_kv_indices,
+            kv_last_page_lens=self.cuda_graph_kv_last_page_lens[:bs],
         )
+
+    def _fill_decode_metadata_inplace(
+        self, bs, req_pool_indices, seq_lens, req_to_page
+    ) -> None:
+        """Refresh the persistent decode buffers in place (sync-free) for replay."""
+        device = self.cuda_graph_kv_indptr.device
+        req_pool_indices = req_pool_indices[:bs]
+        seq_lens = seq_lens[:bs].to(device=device, dtype=torch.int64)
+        num_pages = (seq_lens + self.page_size - 1) // self.page_size  # [bs]
+
+        self.cuda_graph_kv_indptr[: bs + 1].zero_()
+        self.cuda_graph_kv_indptr[1 : bs + 1] = torch.cumsum(num_pages, dim=0).to(
+            torch.int32
+        )
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_page,
+            req_pool_indices,
+            num_pages.to(torch.int32),
+            self.cuda_graph_kv_indptr,
+            None,
+            self.cuda_graph_kv_indices,
+            req_to_page.stride(0),
+        )
+        self.cuda_graph_kv_last_page_lens[:bs] = (
+            (seq_lens - 1) % self.page_size + 1
+        ).to(torch.int32)
+        self._set_decode_metadata_from_buffers(bs)
+
+    def init_forward_metadata_capture_cuda_graph(
+        self, bs, req_pool_indices, seq_lens, forward_mode, **kwargs
+    ):
+        if not forward_mode.is_decode_or_idle():
+            raise RuntimeError(
+                "AiterMLABackend graph capture supports decode only; "
+                f"got {forward_mode}"
+            )
+        # Capture-time content is irrelevant — the kernel reads the buffers
+        # refreshed at replay. Establish a valid dummy layout (1 page/req, since
+        # the seq-len fill value is 1) so the captured launch is well-formed.
+        device = self.cuda_graph_kv_indptr.device
+        self.cuda_graph_kv_indptr[: bs + 1] = torch.arange(
+            0, bs + 1, dtype=torch.int32, device=device
+        )
+        self.cuda_graph_kv_indices[:bs].zero_()
+        self.cuda_graph_kv_last_page_lens[:bs].fill_(1)
+        self._set_decode_metadata_from_buffers(bs)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs,
+        req_pool_indices,
+        seq_lens,
+        forward_mode=None,
+        req_to_page=None,
+        **kwargs,
+    ):
+        if forward_mode is None or not forward_mode.is_decode_or_idle():
+            raise RuntimeError(
+                "AiterMLABackend graph replay supports decode only; "
+                f"got {forward_mode}"
+            )
+        if req_to_page is None:
+            raise RuntimeError("AiterMLABackend graph replay requires req_to_page.")
+        self._fill_decode_metadata_inplace(bs, req_pool_indices, seq_lens, req_to_page)
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         return 1
