@@ -49,6 +49,7 @@ _is_amd = current_platform().is_amd
 
 if _is_amd:
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
+    from tokenspeed_kernel.ops.norm.triton import dual_rmsnorm as triton_dual_rmsnorm
 else:
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
@@ -411,24 +412,40 @@ class FusedRMSNorm(nn.Module):
             Tuple of (normalized_q_a, normalized_kv_a)
         """
         if _is_amd:
-            # No fused parallel RMSNorm kernel on HIP. Apply the two RMSNorms
-            # sequentially via the (AMD-supported) triton RMSNorm — numerically
-            # identical to the fused kernel. Write straight into output_* (or the
-            # input in place when no separate output is given); triton_rmsnorm
-            # supports an arbitrary out= buffer, so this avoids the extra
-            # allocation + copy of normalizing into a temp first.
-            triton_rmsnorm(
-                input_q_a,
-                self.q_a_norm.weight.data,
-                self.q_a_norm.variance_epsilon,
-                out=output_q_a if output_q_a is not None else input_q_a,
-            )
-            triton_rmsnorm(
-                input_kv_a,
-                self.kv_a_norm.weight.data,
-                self.kv_a_norm.variance_epsilon,
-                out=output_kv_a if output_kv_a is not None else input_kv_a,
-            )
+            eps_q = self.q_a_norm.variance_epsilon
+            eps_kv = self.kv_a_norm.variance_epsilon
+            if eps_q == eps_kv:
+                # Fused single-launch dual RMSNorm (vendored xkernels) — both
+                # latents normalized in one kernel instead of two sequential
+                # RMSNorm launches; numerically identical. Writes straight into
+                # output_* (or the input in place when no separate output is
+                # given) via the kernel's out= buffers, avoiding an extra
+                # allocation + copy.
+                triton_dual_rmsnorm(
+                    input_q_a,
+                    self.q_a_norm.weight.data,
+                    input_kv_a,
+                    self.kv_a_norm.weight.data,
+                    eps1=eps_q,
+                    eps2=eps_kv,
+                    out1=output_q_a,
+                    out2=output_kv_a,
+                )
+            else:
+                # Differing epsilons: the fused kernel uses a single epsilon, so
+                # fall back to the two-launch path (numerically identical).
+                triton_rmsnorm(
+                    input_q_a,
+                    self.q_a_norm.weight.data,
+                    eps_q,
+                    out=output_q_a if output_q_a is not None else input_q_a,
+                )
+                triton_rmsnorm(
+                    input_kv_a,
+                    self.kv_a_norm.weight.data,
+                    eps_kv,
+                    out=output_kv_a if output_kv_a is not None else input_kv_a,
+                )
         else:
             rmsnorm_fused_parallel(
                 input1=input_q_a,

@@ -32,6 +32,16 @@ import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton_kernels  # noqa: F401
 import tokenspeed_kernel.ops.moe.trtllm  # noqa: F401
+
+# Opt-in xkernels INT4 W4A16 experts GEMM (vendored). Registered for A/B testing
+# via expected_kernel_name; never auto-selected over the in-tree kernel. Guarded
+# so a vendored-import issue never breaks the core moe ops registration.
+try:
+    import tokenspeed_kernel.ops.moe.xkernels  # noqa: F401
+except Exception:  # pragma: no cover - vendored/triton import optional
+    logging.getLogger(__name__).debug(
+        "xkernels INT4 MoE backend not registered", exc_info=True
+    )
 import torch
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (  # noqa: F401
     ExpertLocationDispatchInfo,
