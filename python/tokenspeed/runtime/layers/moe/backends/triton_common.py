@@ -144,7 +144,7 @@ def triton_forward(
             torch.zeros_like(topk_weights),
         )
     m_tokens = hidden_states.shape[0]
-    num_experts, intermediate_size_x2, _packed_hidden = layer.w13_weight.shape
+    num_experts, intermediate_size_x2, _ = layer.w13_weight.shape
     # Logical hidden = MoE input/output dim. Reading it from hidden_states keeps
     # this correct when w13_weight is packed along K (in-kernel INT4 path), where
     # layer.w13_weight.shape[-1] is hidden // pack_factor, not hidden.

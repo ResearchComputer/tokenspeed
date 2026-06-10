@@ -413,16 +413,22 @@ class FusedRMSNorm(nn.Module):
         if _is_amd:
             # No fused parallel RMSNorm kernel on HIP. Apply the two RMSNorms
             # sequentially via the (AMD-supported) triton RMSNorm — numerically
-            # identical to the fused kernel. Honor the same output contract:
-            # write into output_* when given, else normalize the input in place.
-            if output_q_a is not None:
-                output_q_a.copy_(self.q_a_norm(input_q_a))
-            else:
-                self.q_a_norm(input_q_a, inplace=True)
-            if output_kv_a is not None:
-                output_kv_a.copy_(self.kv_a_norm(input_kv_a))
-            else:
-                self.kv_a_norm(input_kv_a, inplace=True)
+            # identical to the fused kernel. Write straight into output_* (or the
+            # input in place when no separate output is given); triton_rmsnorm
+            # supports an arbitrary out= buffer, so this avoids the extra
+            # allocation + copy of normalizing into a temp first.
+            triton_rmsnorm(
+                input_q_a,
+                self.q_a_norm.weight.data,
+                self.q_a_norm.variance_epsilon,
+                out=output_q_a if output_q_a is not None else input_q_a,
+            )
+            triton_rmsnorm(
+                input_kv_a,
+                self.kv_a_norm.weight.data,
+                self.kv_a_norm.variance_epsilon,
+                out=output_kv_a if output_kv_a is not None else input_kv_a,
+            )
         else:
             rmsnorm_fused_parallel(
                 input1=input_q_a,

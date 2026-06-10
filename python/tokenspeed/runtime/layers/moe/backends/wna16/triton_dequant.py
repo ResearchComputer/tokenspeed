@@ -39,7 +39,10 @@ from tokenspeed.runtime.layers.moe.backends.triton_common import (
     build_triton_gemms,
     triton_forward,
 )
-from tokenspeed.runtime.layers.moe.backends.wna16.weights import attach_marlin_weights
+from tokenspeed.runtime.layers.moe.backends.wna16.weights import (
+    attach_marlin_weights,
+    drop_wna16_staging_params,
+)
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.layers.quantization import CompressedTensorsConfig
 from tokenspeed.runtime.layers.quantization.compressed_tensors.w4a16_dequant import (
@@ -120,18 +123,7 @@ class Wna16DequantBackend(MoEBackend):
             self._num_bits,
         )
         # Register dense bf16 expert weights and drop the packed/quant params.
-        for name in (
-            "w13_weight_packed",
-            "w2_weight_packed",
-            "w13_weight_scale",
-            "w2_weight_scale",
-            "w13_weight_shape",
-            "w2_weight_shape",
-            "w13_weight_g_idx",
-            "w2_weight_g_idx",
-        ):
-            if hasattr(layer, name):
-                delattr(layer, name)
+        drop_wna16_staging_params(layer)
         layer.register_parameter("w13_weight", nn.Parameter(w13, requires_grad=False))
         layer.register_parameter("w2_weight", nn.Parameter(w2, requires_grad=False))
         # Now that dense bf16 weights exist, build the standard bf16 Triton gemms.

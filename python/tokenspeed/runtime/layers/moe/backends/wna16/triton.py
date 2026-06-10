@@ -46,7 +46,10 @@ from tokenspeed.runtime.layers.moe.backends.triton_common import (
     build_triton_gemms,
     triton_forward,
 )
-from tokenspeed.runtime.layers.moe.backends.wna16.weights import attach_marlin_weights
+from tokenspeed.runtime.layers.moe.backends.wna16.weights import (
+    attach_marlin_weights,
+    drop_wna16_staging_params,
+)
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.layers.quantization import CompressedTensorsConfig
 
@@ -125,18 +128,7 @@ class Wna16TritonBackend(MoEBackend):
         w2_packed = _to_kernel_layout(layer.w2_weight_packed.data)
         w13_scale = _to_kernel_layout(layer.w13_weight_scale.data)  # [E, N, K//group]
         w2_scale = _to_kernel_layout(layer.w2_weight_scale.data)
-        for name in (
-            "w13_weight_packed",
-            "w2_weight_packed",
-            "w13_weight_scale",
-            "w2_weight_scale",
-            "w13_weight_shape",
-            "w2_weight_shape",
-            "w13_weight_g_idx",
-            "w2_weight_g_idx",
-        ):
-            if hasattr(layer, name):
-                delattr(layer, name)
+        drop_wna16_staging_params(layer)
         layer.register_parameter(
             "w13_weight", nn.Parameter(w13_packed, requires_grad=False)
         )
