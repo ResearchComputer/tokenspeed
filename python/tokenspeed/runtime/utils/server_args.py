@@ -1267,6 +1267,7 @@ class ServerArgs:
         # Kernel backend
         attention_backend_choices = [
             "mha",
+            "mla",
             "fa3",
             "fa4",
             "triton",
@@ -1301,7 +1302,7 @@ class ServerArgs:
                 "MHA extend strategy for prefix-cache/chunked-prefill batches. "
                 "'paged' uses one paged KV-cache attention kernel over full visible KV; "
                 "'ragged' uses ragged current-chunk prefill plus paged cached-prefix "
-                "attention and merges with mha_merge_state."
+                "attention and merges with merge_state."
             ),
         )
         parser.add_argument(

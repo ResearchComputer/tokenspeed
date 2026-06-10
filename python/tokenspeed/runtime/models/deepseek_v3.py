@@ -31,7 +31,7 @@ from typing import Any, Tuple
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention import mha_merge_state
+from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
@@ -450,9 +450,9 @@ class DeepseekV3AttentionMLA(nn.Module):
     # the absorbed decode query; the backend reads the paged latent cache.
     # (aiter_mla follows the flashmla pattern instead: it is the AMD default and
     # writes its own decode KV via set_kv_buffer, so it is intentionally not here.)
-    _MLA_KERNEL_BACKENDS = ("trtllm_mla", "tokenspeed_mla")
+    _MLA_KERNEL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
     # Backends that support chunked ragged prefill with prefix replay.
-    _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla")
+    _RAGGED_PREFILL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
 
     def __init__(
         self,
@@ -1045,12 +1045,12 @@ class DeepseekV3AttentionMLA(nn.Module):
             )
 
             # Merge this chunk's partial attention state into the running
-            # accumulator. Route through the registry op (mha_merge_state selects
+            # accumulator. Route through the registry op (attn_merge_state selects
             # the CUDA kernel on NVIDIA, the Triton kernel on AMD) rather than the
             # NVIDIA-only thirdparty merge_state, which would crash on AMD in the
             # chunked-prefill path. The op returns fresh tensors, so copy back to
             # emulate the previous inplace accumulation.
-            merged_out, merged_lse = mha_merge_state(
+            merged_out, merged_lse = attn_merge_state(
                 output_view,
                 accum_lse,
                 chunk_output,
