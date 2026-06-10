@@ -673,38 +673,68 @@ def fused_moe_kernel(
                 other=0.0,
             )
 
-        if b_desc is not None:
-            b = (
-                b_desc.load([off_experts_i32, start_offs_n, k_start])
-                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
-                .T
+        if use_int4_w4a16:
+            # Packed B: [E, N, K // 8] int32 holding 8 uint4b8 values along K
+            # (low nibble = lowest K index). Per-element unpack within the tile:
+            # load the int32 for each (k, n), shift by (k % 8) * 4, mask to 4 bits,
+            # and subtract 8 (uint4b8 -> signed int4). Then apply the per-(K-group, N)
+            # scale (B_scale is [E, N, K // group_k]) and accumulate.
+            kk = k_start + offs_k  # [BLOCK_SIZE_K] absolute K indices
+            kmask = kk < K
+            bpack = tl.load(
+                b_ptr
+                + off_experts * stride_be
+                + (kk[:, None] // 8) * stride_bk
+                + offs_bn[None, :] * stride_bn,
+                mask=kmask[:, None],
+                other=0,
             )
-        elif even_Ks:
-            b = tl.load(b_ptrs)
+            b_int = ((bpack >> ((kk[:, None] % 8) * 4)) & 0xF).to(tl.float32) - 8.0
+            g = kk // group_k
+            bscl = tl.load(
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn[None, :] * stride_bsn
+                + g[:, None] * stride_bsk,
+                mask=kmask[:, None],
+                other=0.0,
+            )
+            accumulator += tl.dot(a, (b_int * bscl).to(compute_type))
         else:
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
-
-        # We accumulate along the K dimension.
-        if use_int8_w8a16:
-            accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
-        elif use_fp8_w8a8:
-            if group_k > 0 and group_n > 0:
-                offs_ks = k_start // group_k
-                a_scale = tl.load(
-                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+            if b_desc is not None:
+                b = (
+                    b_desc.load([off_experts_i32, start_offs_n, k_start])
+                    .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
+                    .T
                 )
-                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-                if BLOCK_SIZE_N > group_n:
-                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
-                else:
-                    accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
+            elif even_Ks:
+                b = tl.load(b_ptrs)
             else:
-                if use_fp8_w8a8:
-                    accumulator = tl.dot(a, b, acc=accumulator)
+                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
+
+            # We accumulate along the K dimension.
+            if use_int8_w8a16:
+                accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
+            elif use_fp8_w8a8:
+                if group_k > 0 and group_n > 0:
+                    offs_ks = k_start // group_k
+                    a_scale = tl.load(
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                    )
+                    b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                    if BLOCK_SIZE_N > group_n:
+                        accumulator += (
+                            tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                        )
+                    else:
+                        accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
                 else:
-                    accumulator += tl.dot(a, b)
-        else:
-            accumulator += tl.dot(a, b)
+                    if use_fp8_w8a8:
+                        accumulator = tl.dot(a, b, acc=accumulator)
+                    else:
+                        accumulator += tl.dot(a, b)
+            else:
+                accumulator += tl.dot(a, b)
 
         # Advance the ptrs to the next K block.
         if a_desc is None:
@@ -846,7 +876,10 @@ def invoke_fused_moe_kernel(
             * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
         )
 
-    K = B.shape[2] - padded_size
+    # For W4A16, B is packed [E, N, K // 8] int32, so the logical K is 8x the
+    # last dim. The in-kernel int4 path recomputes its packed pointers per K-block
+    # (it does not use the incremental b_ptrs), so only K needs adjusting here.
+    K = (B.shape[2] * 8 if use_int4_w4a16 else B.shape[2]) - padded_size
     even_Ks = K % config["BLOCK_SIZE_K"] == 0
 
     if a_use_tma or b_use_tma:
