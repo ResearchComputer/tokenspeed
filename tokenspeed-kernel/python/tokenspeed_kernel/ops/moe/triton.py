@@ -688,8 +688,10 @@ def fused_moe_kernel(
                 + offs_bn[None, :] * stride_bn,
                 mask=kmask[:, None],
                 other=0,
-            )
-            b_int = ((bpack >> ((kk[:, None] % 8) * 4)) & 0xF).to(tl.float32) - 8.0
+            ).to(tl.int32)
+            nib = (kk % 8).to(tl.int32)  # [BLOCK_SIZE_K] nibble index
+            b_u4 = (bpack >> (nib[:, None] * 4)) & 0xF  # [BK, BN] int32 in [0, 15]
+            b_int = b_u4.to(tl.float32) - 8.0  # uint4b8 -> signed [-8, 7]
             g = kk // group_k
             bscl = tl.load(
                 b_scale_ptr
@@ -699,7 +701,13 @@ def fused_moe_kernel(
                 mask=kmask[:, None],
                 other=0.0,
             )
-            accumulator += tl.dot(a, (b_int * bscl).to(compute_type))
+            # Dequantize in f32 (bscl is bf16), then cast to a.dtype so the
+            # tl.dot rhs matches the lhs exactly. compute_type may be a foreign
+            # triton.language dtype (the runtime imports stock triton, the
+            # kernel uses tokenspeed_triton) which tl.dot's same-dtype assert
+            # rejects; a.dtype is always the in-tensor (tokenspeed_triton) type.
+            b_deq = (b_int * bscl.to(tl.float32)).to(a.dtype)
+            accumulator += tl.dot(a, b_deq)
         else:
             if b_desc is not None:
                 b = (
@@ -919,7 +927,7 @@ def invoke_fused_moe_kernel(
         expert_ids,
         num_tokens_post_padded,
         B.shape[1],
-        B.shape[2] - padded_size,
+        K,
         sorted_token_ids.shape[0],
         topk_ids.numel(),
         A.stride(0),
