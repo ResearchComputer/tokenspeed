@@ -1193,10 +1193,11 @@ def moe_align_block_size_amd(
     Produces the same ``(sorted_token_ids, expert_ids, num_tokens_post_padded)``
     layout as the trtllm kernel: token-k flat ids (``0..numel-1``) grouped by
     expert, each expert's run padded up to a multiple of ``block_size`` with
-    ``pad_id = topk_ids.numel()``; the unused tail stays ``pad_id``. Operates on
-    the small routing tensor (correctness-first; a Triton perf kernel is a
-    follow-up). Filtered/EP tokens (expert == ``num_experts``) are dropped
-    (treated as padding) — the single-node bf16 path has none.
+    ``pad_id = topk_ids.numel()``; the unused tail stays ``pad_id``. Fully
+    vectorized and sync-free (no per-expert ``.item()``/Python loop), so it adds
+    no host stalls and is CUDA/HIP-graph capturable. Filtered/EP tokens
+    (expert == ``num_experts``) are dropped (treated as padding) — the
+    single-node bf16 path has none.
 
     Parameters:
     - topk_ids: ``[total_tokens, top_k]`` int32 expert indices per token.
@@ -1212,34 +1213,63 @@ def moe_align_block_size_amd(
     max_num_tokens_padded = total + (num_experts + 1) * (block_size - 1)
     max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
 
-    sorted_ids = torch.full(
-        (max_num_tokens_padded,), pad_id, dtype=torch.int32, device=device
+    # Fully vectorized, sync-free. The previous implementation looped
+    # ``for e in range(num_experts)`` with a per-expert ``int(counts[e].item())``
+    # device->host sync; at decode that is ~num_experts syncs per call and tens
+    # of thousands per token across all MoE layers (it dominated the host-bound
+    # decode latency). This version uses only device tensor ops (no ``.item()``,
+    # no Python loop, all buffers fixed-shape), which removes the stalls and is
+    # also CUDA/HIP-graph capturable. Output matches the previous semantics:
+    # token-k flat ids grouped by expert, each expert's run padded to a multiple
+    # of ``block_size``, ``pad_id = numel`` in unused slots; filtered/EP tokens
+    # (expert == num_experts) are dropped (range(num_experts) semantics).
+    flat_expert = topk_ids.reshape(-1).to(torch.int64)
+    # Map filtered/out-of-range experts (>= num_experts) into a drop bin so they
+    # are excluded from the placement below.
+    expert_clamped = torch.clamp(flat_expert, max=num_experts)  # in [0, num_experts]
+
+    # Per-expert token counts. scatter_add (not bincount, which syncs to size
+    # its output) keeps this on-device.
+    counts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+    counts.scatter_add_(0, expert_clamped, torch.ones_like(expert_clamped))
+    counts = counts[:num_experts]  # drop the filtered bin
+
+    # Padded block layout per expert (contiguous in sorted_ids).
+    n_blocks_per_e = (counts + (block_size - 1)) // block_size
+    padded_len_e = n_blocks_per_e * block_size
+    expert_padded_start = torch.cumsum(padded_len_e, dim=0) - padded_len_e
+    cum_blocks = torch.cumsum(n_blocks_per_e, dim=0)
+    total_blocks = (
+        cum_blocks[-1]
+        if num_experts > 0
+        else torch.zeros((), dtype=torch.int64, device=device)
     )
-    expert_ids = torch.zeros((max_num_m_blocks,), dtype=torch.int32, device=device)
 
-    flat_expert = topk_ids.flatten().to(torch.int64)
-    flat_token = torch.arange(total, device=device, dtype=torch.int32)
-    # Group token ids by expert (stable: within-expert order is deterministic;
-    # canonicalization sorts within blocks anyway).
-    order = torch.argsort(flat_expert, stable=True)
-    tokens_by_expert = flat_token[order]
-    counts = torch.bincount(flat_expert, minlength=num_experts + 1)
+    # expert_ids[b] = expert owning block b (empty experts skipped). Blocks past
+    # the used region (b >= total_blocks) stay 0, matching the zero-init default.
+    block_idx = torch.arange(max_num_m_blocks, device=device)
+    eob = torch.searchsorted(cum_blocks, block_idx, right=True)
+    expert_ids = torch.where(block_idx < total_blocks, eob, torch.zeros_like(eob)).to(
+        torch.int32
+    )
 
-    write_pos = 0
-    block_idx = 0
-    offset = 0
-    for e in range(num_experts):  # filtered slot (e == num_experts) is dropped
-        n = int(counts[e].item())
-        grp = tokens_by_expert[offset : offset + n]
-        n_blocks = (n + block_size - 1) // block_size
-        for b in range(n_blocks):
-            cnt = min(block_size, n - b * block_size)
-            start = write_pos + b * block_size
-            sorted_ids[start : start + cnt] = grp[b * block_size : b * block_size + cnt]
-            expert_ids[block_idx + b] = e
-        write_pos += n_blocks * block_size
-        block_idx += n_blocks
-        offset += n
+    # Scatter each (token, k) slot to its padded position, grouped by expert.
+    # One extra scratch slot absorbs dropped (filtered) tokens; it is sliced off.
+    sorted_buf = torch.full(
+        (max_num_tokens_padded + 1,), pad_id, dtype=torch.int32, device=device
+    )
+    order = torch.argsort(expert_clamped, stable=True)  # tokens grouped by expert
+    sorted_experts = expert_clamped[order]
+    tok_excl_prefix = torch.cumsum(counts, dim=0) - counts  # exclusive prefix (tokens)
+    e_safe = torch.clamp(sorted_experts, max=num_experts - 1)
+    rank = torch.arange(total, device=device) - tok_excl_prefix[e_safe]
+    write_pos = expert_padded_start[e_safe] + rank
+    valid = sorted_experts < num_experts
+    write_pos = torch.where(
+        valid, write_pos, torch.full_like(write_pos, max_num_tokens_padded)
+    )
+    sorted_buf[write_pos] = order.to(torch.int32)
+    sorted_ids = sorted_buf[:max_num_tokens_padded]
 
-    num_tokens_post_pad = torch.tensor([write_pos], dtype=torch.int32, device=device)
+    num_tokens_post_pad = padded_len_e.sum().reshape(1).to(torch.int32)
     return sorted_ids, expert_ids, num_tokens_post_pad

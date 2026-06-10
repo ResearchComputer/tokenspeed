@@ -39,6 +39,9 @@ CASES = [
     (37, 2, 8, 16),  # uneven, small
     (256, 8, 64, 32),  # larger block
     (64, 1, 4, 16),  # few experts
+    (1, 8, 48, 16),  # Kimi-K2.6 decode: 48 local experts (EP=8), top-8
+    (512, 8, 48, 16),  # Kimi-K2.6 prefill-scale: many tokens, sparse per-expert
+    (256, 8, 384, 32),  # many experts, most empty per call (sparse blocks)
 ]
 
 
