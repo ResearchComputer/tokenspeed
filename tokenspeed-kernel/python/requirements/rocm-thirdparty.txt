@@ -1,2 +1,6 @@
 tokenspeed-triton-kernels==1.0.0.post20260510
 tokenspeed-iris==0.0.0.post20260511
+# AITER provides AMD MLA attention kernels (mla_decode_fwd / mla_prefill_fwd).
+# Built from source in the ROCm image (commit pinned there); not published as a
+# wheel matching torch 2.11+rocm7.2.
+aiter

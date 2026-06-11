@@ -27,6 +27,9 @@ from tokenspeed_kernel.ops.communication.triton import (
     all_reduce_can_run,
     create_state,
 )
+from tokenspeed_kernel.platform import current_platform
+
+_IS_NVIDIA = current_platform().is_nvidia
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -57,6 +60,12 @@ class TritonAllReduceBackend(CommBackend):
         return state
 
     def can_run(self, tensor: torch.Tensor, group: Group, op=None) -> bool:
+        # Symmetric-memory (NVLink multimem) all-reduce is NVIDIA-only. On AMD the
+        # rendezvous inside _get_or_create can diverge across ranks (some enter the
+        # symmetric rendezvous and block, others fall back to NCCL), deadlocking
+        # multi-rank/multi-node collectives. Always use the NCCL fallback on AMD.
+        if not _IS_NVIDIA:
+            return False
         if len(group) <= 1:
             return False
         if op is None:

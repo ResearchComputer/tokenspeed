@@ -39,6 +39,24 @@ if not _is_amd:
     from tokenspeed_kernel.ops.activation.flashinfer import (
         silu_and_mul,
     )
+else:
+
+    def silu_and_mul(
+        x: torch.Tensor, out: torch.Tensor | None = None, enable_pdl: bool = False
+    ) -> torch.Tensor:
+        """SiLU-gated activation: ``silu(x[..., :d]) * x[..., d:]``.
+
+        Pure-torch AMD fallback for the kernel exposed on NVIDIA, so callers
+        (e.g. the Triton MoE backend) can import a module-level ``silu_and_mul``.
+        Writes into ``out`` when provided.
+        """
+        d = x.shape[-1] // 2
+        result = F.silu(x[..., :d]) * x[..., d:]
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
 
 logger = get_colorful_logger(__name__)
 

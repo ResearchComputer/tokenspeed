@@ -538,10 +538,17 @@ class ServerArgs:
 
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations.
+        # NOTE: not auto-enabled on AMD. The AMD fused-allreduce path
+        # (``forward_with_allreduce_fusion``) is backed by the iris symmetric-memory
+        # kernels, whose Triton device functions (``iris.mem.triton.ops.load``) are
+        # not compatible with tokenspeed's vendored Triton on the current ROCm stack
+        # (raises ``Unsupported function referenced`` at warmup). Until iris/Triton
+        # compatibility is resolved, AMD must use the standard (non-fused) all-reduce;
+        # users can still opt in explicitly with ``--enable-allreduce-fusion``.
         platform = current_platform()
         if (
             not self.enable_allreduce_fusion
-            and (current_platform().is_hopper_plus or platform.is_amd)
+            and platform.is_hopper_plus
             and self.mapping.nnodes == 1
             and self.mapping.has_attn_tp
             and not self.mapping.has_attn_dp
@@ -1269,6 +1276,7 @@ class ServerArgs:
             "trtllm_mla",
             "flashmla",
             "tokenspeed_mla",
+            "aiter_mla",
             "hybrid_linear_attn",
         ]
         parser.add_argument(

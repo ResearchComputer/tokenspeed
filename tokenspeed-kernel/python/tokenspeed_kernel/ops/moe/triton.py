@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
 )
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.trtllm import (
@@ -672,38 +673,76 @@ def fused_moe_kernel(
                 other=0.0,
             )
 
-        if b_desc is not None:
-            b = (
-                b_desc.load([off_experts_i32, start_offs_n, k_start])
-                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
-                .T
+        if use_int4_w4a16:
+            # Packed B: [E, N, K // 8] int32 holding 8 uint4b8 values along K
+            # (low nibble = lowest K index). Per-element unpack within the tile:
+            # load the int32 for each (k, n), shift by (k % 8) * 4, mask to 4 bits,
+            # and subtract 8 (uint4b8 -> signed int4). Then apply the per-(K-group, N)
+            # scale (B_scale is [E, N, K // group_k]) and accumulate.
+            kk = k_start + offs_k  # [BLOCK_SIZE_K] absolute K indices
+            kmask = kk < K
+            bpack = tl.load(
+                b_ptr
+                + off_experts * stride_be
+                + (kk[:, None] // 8) * stride_bk
+                + offs_bn[None, :] * stride_bn,
+                mask=kmask[:, None],
+                other=0,
+            ).to(tl.int32)
+            nib = (kk % 8).to(tl.int32)  # [BLOCK_SIZE_K] nibble index
+            b_u4 = (bpack >> (nib[:, None] * 4)) & 0xF  # [BK, BN] int32 in [0, 15]
+            b_int = b_u4.to(tl.float32) - 8.0  # uint4b8 -> signed [-8, 7]
+            g = kk // group_k
+            bscl = tl.load(
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn[None, :] * stride_bsn
+                + g[:, None] * stride_bsk,
+                mask=kmask[:, None],
+                other=0.0,
             )
-        elif even_Ks:
-            b = tl.load(b_ptrs)
+            # Dequantize in f32 (bscl is bf16), then cast to a.dtype so the
+            # tl.dot rhs matches the lhs exactly. compute_type may be a foreign
+            # triton.language dtype (the runtime imports stock triton, the
+            # kernel uses tokenspeed_triton) which tl.dot's same-dtype assert
+            # rejects; a.dtype is always the in-tensor (tokenspeed_triton) type.
+            b_deq = (b_int * bscl.to(tl.float32)).to(a.dtype)
+            accumulator += tl.dot(a, b_deq)
         else:
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
-
-        # We accumulate along the K dimension.
-        if use_int8_w8a16:
-            accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
-        elif use_fp8_w8a8:
-            if group_k > 0 and group_n > 0:
-                offs_ks = k_start // group_k
-                a_scale = tl.load(
-                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+            if b_desc is not None:
+                b = (
+                    b_desc.load([off_experts_i32, start_offs_n, k_start])
+                    .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
+                    .T
                 )
-                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-                if BLOCK_SIZE_N > group_n:
-                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
-                else:
-                    accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
+            elif even_Ks:
+                b = tl.load(b_ptrs)
             else:
-                if use_fp8_w8a8:
-                    accumulator = tl.dot(a, b, acc=accumulator)
+                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
+
+            # We accumulate along the K dimension.
+            if use_int8_w8a16:
+                accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
+            elif use_fp8_w8a8:
+                if group_k > 0 and group_n > 0:
+                    offs_ks = k_start // group_k
+                    a_scale = tl.load(
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                    )
+                    b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                    if BLOCK_SIZE_N > group_n:
+                        accumulator += (
+                            tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                        )
+                    else:
+                        accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
                 else:
-                    accumulator += tl.dot(a, b)
-        else:
-            accumulator += tl.dot(a, b)
+                    if use_fp8_w8a8:
+                        accumulator = tl.dot(a, b, acc=accumulator)
+                    else:
+                        accumulator += tl.dot(a, b)
+            else:
+                accumulator += tl.dot(a, b)
 
         # Advance the ptrs to the next K block.
         if a_desc is None:
@@ -845,7 +884,10 @@ def invoke_fused_moe_kernel(
             * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
         )
 
-    K = B.shape[2] - padded_size
+    # For W4A16, B is packed [E, N, K // 8] int32, so the logical K is 8x the
+    # last dim. The in-kernel int4 path recomputes its packed pointers per K-block
+    # (it does not use the incremental b_ptrs), so only K needs adjusting here.
+    K = (B.shape[2] * 8 if use_int4_w4a16 else B.shape[2]) - padded_size
     even_Ks = K % config["BLOCK_SIZE_K"] == 0
 
     if a_use_tma or b_use_tma:
@@ -885,7 +927,7 @@ def invoke_fused_moe_kernel(
         expert_ids,
         num_tokens_post_padded,
         B.shape[1],
-        B.shape[2] - padded_size,
+        K,
         sorted_token_ids.shape[0],
         topk_ids.numel(),
         A.stride(0),
@@ -1053,6 +1095,7 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     },
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
 )
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
@@ -1126,4 +1169,107 @@ def moe_align_block_size(
         fuse_sorted_ids_padding,
     )
 
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+@register_kernel(
+    "moe",
+    "dispatch",
+    name="amd_moe_align_block_size",
+    solution="triton",
+    signatures=format_signatures("indices", "dense", {torch.int32}),
+    traits={
+        "comm_strategy": frozenset({"local"}),
+    },
+    priority=Priority.PERFORMANT + 2,
+    tags={"portability"},
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+)
+def moe_align_block_size_amd(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """AMD torch implementation of moe_align_block_size.
+
+    Produces the same ``(sorted_token_ids, expert_ids, num_tokens_post_padded)``
+    layout as the trtllm kernel: token-k flat ids (``0..numel-1``) grouped by
+    expert, each expert's run padded up to a multiple of ``block_size`` with
+    ``pad_id = topk_ids.numel()``; the unused tail stays ``pad_id``. Fully
+    vectorized and sync-free (no per-expert ``.item()``/Python loop), so it adds
+    no host stalls and is CUDA/HIP-graph capturable. Filtered/EP tokens
+    (expert == ``num_experts``) are dropped (treated as padding) — the
+    single-node bf16 path has none.
+
+    Parameters:
+    - topk_ids: ``[total_tokens, top_k]`` int32 expert indices per token.
+    - block_size: block size for the fused-expert block GEMM.
+    - num_experts: number of routed experts.
+
+    Returns ``(sorted_token_ids, expert_ids, num_tokens_post_padded)`` matching
+    the ``moe/dispatch`` contract consumed by ``invoke_fused_moe_kernel``.
+    """
+    device = topk_ids.device
+    total = topk_ids.numel()
+    pad_id = total
+    max_num_tokens_padded = total + (num_experts + 1) * (block_size - 1)
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
+
+    # Fully vectorized, sync-free. The previous implementation looped
+    # ``for e in range(num_experts)`` with a per-expert ``int(counts[e].item())``
+    # device->host sync; at decode that is ~num_experts syncs per call and tens
+    # of thousands per token across all MoE layers (it dominated the host-bound
+    # decode latency). This version uses only device tensor ops (no ``.item()``,
+    # no Python loop, all buffers fixed-shape), which removes the stalls and is
+    # also CUDA/HIP-graph capturable. Output matches the previous semantics:
+    # token-k flat ids grouped by expert, each expert's run padded to a multiple
+    # of ``block_size``, ``pad_id = numel`` in unused slots; filtered/EP tokens
+    # (expert == num_experts) are dropped (range(num_experts) semantics).
+    flat_expert = topk_ids.reshape(-1).to(torch.int64)
+    # Map filtered/out-of-range experts (>= num_experts) into a drop bin so they
+    # are excluded from the placement below.
+    expert_clamped = torch.clamp(flat_expert, max=num_experts)  # in [0, num_experts]
+
+    # Per-expert token counts. scatter_add (not bincount, which syncs to size
+    # its output) keeps this on-device.
+    counts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+    counts.scatter_add_(0, expert_clamped, torch.ones_like(expert_clamped))
+    counts = counts[:num_experts]  # drop the filtered bin
+
+    # Padded block layout per expert (contiguous in sorted_ids).
+    n_blocks_per_e = (counts + (block_size - 1)) // block_size
+    padded_len_e = n_blocks_per_e * block_size
+    expert_padded_start = torch.cumsum(padded_len_e, dim=0) - padded_len_e
+    cum_blocks = torch.cumsum(n_blocks_per_e, dim=0)
+    total_blocks = (
+        cum_blocks[-1]
+        if num_experts > 0
+        else torch.zeros((), dtype=torch.int64, device=device)
+    )
+
+    # expert_ids[b] = expert owning block b (empty experts skipped). Blocks past
+    # the used region (b >= total_blocks) stay 0, matching the zero-init default.
+    block_idx = torch.arange(max_num_m_blocks, device=device)
+    eob = torch.searchsorted(cum_blocks, block_idx, right=True)
+    expert_ids = torch.where(block_idx < total_blocks, eob, torch.zeros_like(eob)).to(
+        torch.int32
+    )
+
+    # Scatter each (token, k) slot to its padded position, grouped by expert.
+    # One extra scratch slot absorbs dropped (filtered) tokens; it is sliced off.
+    sorted_buf = torch.full(
+        (max_num_tokens_padded + 1,), pad_id, dtype=torch.int32, device=device
+    )
+    order = torch.argsort(expert_clamped, stable=True)  # tokens grouped by expert
+    sorted_experts = expert_clamped[order]
+    tok_excl_prefix = torch.cumsum(counts, dim=0) - counts  # exclusive prefix (tokens)
+    e_safe = torch.clamp(sorted_experts, max=num_experts - 1)
+    rank = torch.arange(total, device=device) - tok_excl_prefix[e_safe]
+    write_pos = expert_padded_start[e_safe] + rank
+    valid = sorted_experts < num_experts
+    write_pos = torch.where(
+        valid, write_pos, torch.full_like(write_pos, max_num_tokens_padded)
+    )
+    sorted_buf[write_pos] = order.to(torch.int32)
+    sorted_ids = sorted_buf[:max_num_tokens_padded]
+
+    num_tokens_post_pad = padded_len_e.sum().reshape(1).to(torch.int32)
     return sorted_ids, expert_ids, num_tokens_post_pad

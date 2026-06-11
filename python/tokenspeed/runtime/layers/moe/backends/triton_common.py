@@ -26,6 +26,7 @@ from functools import partial
 import tokenspeed_kernel
 import torch
 import triton.language as tl
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.backends.triton_config import (
@@ -33,6 +34,8 @@ from tokenspeed.runtime.layers.moe.backends.triton_config import (
 )
 from tokenspeed.runtime.layers.moe.core.types import MoELayerSpec
 from tokenspeed.runtime.utils.env import envs
+
+_IS_AMD = current_platform().is_amd
 
 __all__ = [
     "support_tensor_descriptor",
@@ -47,20 +50,27 @@ def build_triton_gemms(
     spec: MoELayerSpec,
     *,
     use_fp8_w8a8: bool = False,
+    use_int4_w4a16: bool = False,
+    pack_factor: int = 1,
     per_channel_quant: bool = False,
     block_shape=None,
     dtype_tag: str = "bf16",
     gate_up_B_scale=None,
     down_B_scale=None,
 ):
-    num_local_experts, intermediate_size_x2, hidden_size = layer.w13_weight.shape
+    # For the in-kernel INT4 path, w13_weight is packed [E, N, K // pack_factor]
+    # along K, so recover the logical hidden (K) by multiplying the last dim by
+    # pack_factor. N (intermediate_size_x2) is never packed. pack_factor == 1
+    # leaves dense bf16/fp8 weights unchanged.
+    num_local_experts, intermediate_size_x2, packed_hidden = layer.w13_weight.shape
+    hidden_size = packed_hidden * pack_factor
     intermediate_size = intermediate_size_x2 // 2
 
     common = dict(
         compute_type=tl.bfloat16,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=False,
-        use_int4_w4a16=False,
+        use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         filter_expert=True,
@@ -134,7 +144,11 @@ def triton_forward(
             torch.zeros_like(topk_weights),
         )
     m_tokens = hidden_states.shape[0]
-    num_experts, intermediate_size_x2, hidden_size = layer.w13_weight.shape
+    num_experts, intermediate_size_x2, _ = layer.w13_weight.shape
+    # Logical hidden = MoE input/output dim. Reading it from hidden_states keeps
+    # this correct when w13_weight is packed along K (in-kernel INT4 path), where
+    # layer.w13_weight.shape[-1] is hidden // pack_factor, not hidden.
+    hidden_size = hidden_states.shape[-1]
     top_k = topk_ids.shape[1]
     dtype = hidden_states.dtype
     device = hidden_states.device
@@ -215,9 +229,18 @@ def triton_forward(
 
     out_hidden_states = torch.empty_like(hidden_states)
     # Current limitation: Should avoid using runtime shapes as traits
-    expected_combine_kernel = (
-        "torch_compile_moe_sum_reduce" if m_tokens <= 32 else "triton_moe_sum_reduce"
-    )
+    if _IS_AMD:
+        # The torch.compile (inductor) combine path aborts under concurrent
+        # per-rank inductor compile workers on AMD ("Fatal Python error: Aborted"
+        # in _inductor/compile_worker). Use the hand-written Triton combine, which
+        # has no torch.compile dependency, regardless of token count.
+        expected_combine_kernel = "triton_moe_sum_reduce"
+    else:
+        expected_combine_kernel = (
+            "torch_compile_moe_sum_reduce"
+            if m_tokens <= 32
+            else "triton_moe_sum_reduce"
+        )
     routed_scaling_factor = 1.0
     tokenspeed_kernel.moe_combine(
         intermediate_cache3,

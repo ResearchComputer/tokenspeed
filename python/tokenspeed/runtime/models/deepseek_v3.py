@@ -31,6 +31,7 @@ from typing import Any, Tuple
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
@@ -41,7 +42,6 @@ from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.ops.routing.cuda import dsv3_router_gemm
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -446,7 +446,10 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
 
 
 class DeepseekV3AttentionMLA(nn.Module):
-    # Backends that use non-absorbed MLA kernels (ragged prefill, paged KV decode).
+    # Backends where the model owns the KV write (set_mla_kv_buffer) and produces
+    # the absorbed decode query; the backend reads the paged latent cache.
+    # (aiter_mla follows the flashmla pattern instead: it is the AMD default and
+    # writes its own decode KV via set_kv_buffer, so it is intentionally not here.)
     _MLA_KERNEL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
     # Backends that support chunked ragged prefill with prefix replay.
     _RAGGED_PREFILL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
@@ -1041,14 +1044,20 @@ class DeepseekV3AttentionMLA(nn.Module):
                 causal=False,
             )
 
-            merge_state(
+            # Merge this chunk's partial attention state into the running
+            # accumulator. Route through the registry op (attn_merge_state selects
+            # the CUDA kernel on NVIDIA, the Triton kernel on AMD) rather than the
+            # NVIDIA-only thirdparty merge_state, which would crash on AMD in the
+            # chunked-prefill path. The op returns fresh tensors, so copy back to
+            # emulate the previous inplace accumulation.
+            merged_out, merged_lse = attn_merge_state(
                 output_view,
                 accum_lse,
                 chunk_output,
                 lse,
-                inplace=True,
-                enable_pdl=pdl_enabled(),
             )
+            output_view.copy_(merged_out)
+            accum_lse.copy_(merged_lse)
 
         return output
 
@@ -1485,11 +1494,15 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                     "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                 ):
                     quant_block_size = 1
-                    if (
-                        self.quant_config is not None
-                        and self.quant_config.weight_block_size is not None
-                    ):
-                        quant_block_size = self.quant_config.weight_block_size[0]
+                    # weight_block_size is an Fp8Config (block-quantized) attribute;
+                    # other quant configs (e.g. CompressedTensorsConfig for W4A16
+                    # Kimi-K2.6) do not define it, and the fused q_a/kv_a projections
+                    # are unquantized anyway, so default to a block size of 1.
+                    weight_block_size = getattr(
+                        self.quant_config, "weight_block_size", None
+                    )
+                    if weight_block_size is not None:
+                        quant_block_size = weight_block_size[0]
                     begin_size_mp = {
                         "q_a_proj": 0,
                         "kv_a_proj_with_mqa": self.config.q_lora_rank,
@@ -1992,7 +2005,18 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         torch.cuda.synchronize()
 
 
+class DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
+    """DeepSeek-V2 (e.g. DeepSeek-V2-Lite) reuses the V3 MLA + MoE implementation.
+
+    HF V2 checkpoints advertise ``architectures = ["DeepseekV2ForCausalLM"]``; the
+    attention/MoE code reads its dimensions from the config (``kv_lora_rank``,
+    ``q_lora_rank``, expert counts, …) so the same module serves both. Registered
+    so V2 architectures resolve to this implementation.
+    """
+
+
 EntryClass = [
     DeepseekV3ForCausalLM,
+    DeepseekV2ForCausalLM,
     Eagle3DeepseekV2ForCausalLM,
 ]

@@ -219,3 +219,26 @@ def attach_marlin_weights(backend, layer: nn.Module) -> None:
     layer.a13_scale = None
     layer.a2_scale = None
     layer.marlin_state = GPTQMarlinState.REPACK
+
+
+# The packed-checkpoint staging parameters registered by attach_marlin_weights.
+# Backends drop these in process_weights_after_loading once they have produced
+# their served weights (dense bf16 or repacked INT4). Kept next to the loader
+# so the list stays in sync with what attach_marlin_weights registers.
+_WNA16_STAGING_PARAMS = (
+    "w13_weight_packed",
+    "w2_weight_packed",
+    "w13_weight_scale",
+    "w2_weight_scale",
+    "w13_weight_shape",
+    "w2_weight_shape",
+    "w13_weight_g_idx",
+    "w2_weight_g_idx",
+)
+
+
+def drop_wna16_staging_params(layer: nn.Module) -> None:
+    """Delete the attach_marlin_weights staging params from ``layer`` if present."""
+    for name in _WNA16_STAGING_PARAMS:
+        if hasattr(layer, name):
+            delattr(layer, name)

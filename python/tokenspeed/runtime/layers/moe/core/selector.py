@@ -55,7 +55,7 @@ _AUTO_IMPL_PREFERENCE = {
         "triton",
     ),
     "w8a8_fp8": ("triton",),
-    "wna16": ("marlin",),
+    "wna16": ("marlin", "triton", "triton_dequant"),
 }
 
 
@@ -118,6 +118,15 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
                 impl
                 for impl in auto_candidates
                 if impl in {"gluon_kernel", "triton_kernel"}
+            )
+        elif quant_kind == "wna16":
+            # Marlin is NVIDIA-only. On AMD, prefer the in-kernel INT4 fused MoE
+            # (wna16/triton) which keeps experts packed (~4x memory saving); it
+            # supports only 4-bit symmetric group quant, so fall back to
+            # dequant-on-load to bf16 (wna16/triton_dequant) otherwise. Order
+            # matters: "triton" is tried first, "triton_dequant" is the fallback.
+            auto_candidates = tuple(
+                impl for impl in auto_candidates if impl in {"triton", "triton_dequant"}
             )
 
     if not backend.is_auto():

@@ -65,9 +65,12 @@ def rmsnorm(
     hidden_size = x.shape[-1]
     x_2d = x.view(-1, hidden_size)
     out = torch.empty_like(x) if out is None else out
-    if not out.is_contiguous():
-        raise ValueError("out must be contiguous")
-    out_2d = out.view(-1, hidden_size)
+    # A non-contiguous out (e.g. inplace rmsnorm on a sliced MLA latent KV) can't
+    # be written by the kernel directly; use a contiguous scratch and copy back
+    # so inplace semantics are preserved.
+    out_target = out
+    out_work = out if out.is_contiguous() else torch.empty_like(x)
+    out_2d = out_work.view(-1, hidden_size)
 
     residual_out = torch.empty_like(x) if residual is not None else None
     block = triton.next_power_of_2(hidden_size)
@@ -82,9 +85,11 @@ def rmsnorm(
         BLOCK=block,
         HAS_RESIDUAL=residual is not None,
     )
+    if out_work is not out_target:
+        out_target.copy_(out_work)
     if residual is None:
-        return out
-    return out, residual_out
+        return out_target
+    return out_target, residual_out
 
 
 @triton.jit
