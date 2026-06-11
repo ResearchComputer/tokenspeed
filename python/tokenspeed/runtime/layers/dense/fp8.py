@@ -247,16 +247,35 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
                     layer._use_deep_gemm_fp8 = True
             if is_bmm and not layer._use_deep_gemm_fp8:
-                # The is_bmm runtime path (DeepSeek-V4 o_proj) has no FP32
-                # fallback, so fail fast at load with a clear message instead of
-                # a cryptic AttributeError on the first forward.
-                raise RuntimeError(
-                    "is_bmm weight requires the deep_gemm FP8 block-scale path "
-                    "but it could not be prepared (deep_gemm_available="
-                    f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
-                    f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
-                    "ue8m0 weights with block-aligned dims and deep_gemm installed."
-                )
+                if platform.is_amd:
+                    # No deep_gemm FP8 einsum on AMD (gfx942): dequantize the
+                    # grouped block-scale bmm weight to bf16 once at load. The
+                    # runtime o_proj uses the bf16 einsum fallback (see
+                    # DeepseekV4Attention._project_attention_output).
+                    N, K = layer.weight.shape
+                    block_n, block_k = self.quant_config.weight_block_size
+                    w = layer.weight.data.float().reshape(
+                        N // block_n, block_n, K // block_k, block_k
+                    )
+                    s = layer.weight_scale_inv.data.float().reshape(
+                        N // block_n, 1, K // block_k, 1
+                    )
+                    layer.weight_bf16 = Parameter(
+                        (w * s).reshape(N, K).to(torch.bfloat16),
+                        requires_grad=False,
+                    )
+                    layer._bmm_amd_bf16 = True
+                else:
+                    # The is_bmm runtime path (DeepSeek-V4 o_proj) has no FP32
+                    # fallback, so fail fast at load with a clear message instead
+                    # of a cryptic AttributeError on the first forward.
+                    raise RuntimeError(
+                        "is_bmm weight requires the deep_gemm FP8 block-scale path "
+                        "but it could not be prepared (deep_gemm_available="
+                        f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
+                        f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
+                        "ue8m0 weights with block-aligned dims and deep_gemm installed."
+                    )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
