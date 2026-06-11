@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Opt-in INT4 W4A16 fused-MoE experts GEMM backed by vendored ``xkernels``.
+"""Opt-in INT4 W4A16 fused-MoE experts GEMM backed by ``xkernels``.
 
-This adapts the vendored xkernels INT4 W4A16 grouped-GEMM kernel
-(``thirdparty/xkernels/ops/moe/triton/moe_int4_kernel.py``) to the *exact*
+This adapts the xkernels INT4 W4A16 grouped-GEMM kernel
+(``xkernels/ops/moe/triton/moe_int4_kernel.py``) to the *exact*
 ``invoke_fused_moe_kernel`` call signature used by
 ``tokenspeed.runtime.layers.moe.backends.triton_common.triton_forward``, and
 registers it as ``xkernels_moe_int4_w4a16``.
@@ -33,7 +33,7 @@ It exists so the autotuned xkernels variant can be A/B'd against the in-tree
 default-config kernel without touching the production path. See
 ``docs/xkernels-int4-moe-integration-plan.md``.
 
-Triton-package note: the vendored kernel is imported through the third-party
+Triton-package note: the kernel is imported through the third-party
 boundary, which routes it through ``tokenspeed_kernel._triton`` so it binds the
 ``tokenspeed_triton`` package. ``compute_type`` is taken from the same ``tl`` so
 ``tl.dot`` does not see a cross-package dtype (the kernel additionally casts the
@@ -50,12 +50,13 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-# Importing the vendored moe package registers the xkernels backends under the
-# tokenspeed_triton redirect (see thirdparty/xkernels/ops/moe/__init__.py). We
-# reach in for the kernel object so we can launch it with the caller-supplied
-# dispatch block size (the dispatch stage already padded sorted_token_ids to
-# config["BLOCK_SIZE_M"], so BLOCK_SIZE_M must match — see the integration plan).
-from tokenspeed_kernel.thirdparty.xkernels.ops.moe.triton.moe_int4_kernel import (
+# Importing the xkernels moe package registers its backends under the
+# tokenspeed_triton redirect (xkernels' ops/moe/__init__.py routes the import
+# through its _triton_compat hook). We reach in for the kernel object so we can
+# launch it with the caller-supplied dispatch block size (the dispatch stage
+# already padded sorted_token_ids to config["BLOCK_SIZE_M"], so BLOCK_SIZE_M must
+# match — see the integration plan).
+from xkernels.ops.moe.triton.moe_int4_kernel import (
     fused_moe_int4_kernel as _xkernels_fused_moe_int4_kernel,
 )
 
@@ -65,7 +66,7 @@ __all__ = ["invoke_xkernels_moe_int4_w4a16"]
 def _raw_kernel():
     """Return the underlying ``@triton.jit`` kernel (unwrap the autotuner).
 
-    The vendored kernel is wrapped by ``@triton.autotune``; for the opt-in
+    The kernel is wrapped by ``@triton.autotune``; for the opt-in
     in-flow path we launch it with the caller's fixed ``BLOCK_SIZE_M`` (the one
     the dispatch stage padded to) rather than letting autotune pick its own M
     tile, so we unwrap to the raw JIT function and pass an explicit config.

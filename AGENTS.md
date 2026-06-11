@@ -30,8 +30,16 @@ Inside the root tokenspeed-kernel/ directory:
 
 * All direct tokenspeed-triton imports should happen in `_triton.py` and then
   re-import to other places.
-* All direct third-party code should be placed in `thirdparty/` and imported
-  into `ops/` then registered via `register_kernel`.
+* Third-party kernel code is integrated one of two ways, and either is fine as
+  long as it is imported only inside `tokenspeed-kernel` (never from runtime
+  `tokenspeed`) and registered via `register_kernel` from `ops/`:
+  (a) a **pinned pip dependency** declared in `requirements/` and imported from
+  `ops/` (preferred when the upstream package is self-contained and version-
+  pinnable — e.g. `xkernels`, pinned by git SHA); or
+  (b) **vendored** under `thirdparty/` (use when upstream needs local patches or
+  isn't packaged). Vendor copies must record provenance (a `NOTICE.md` with the
+  upstream commit). Prefer (a) and upstream any local patches so the vendor copy
+  can be dropped.
 * Prefer CuteDSL for NVIDIA GPU kernels and Triton Gluon for AMD GPU kernels.
   Use Triton for portable solutions across vendors. Vendor libraries should
   stay optional, and other solutions may be used as temporary transitions, but

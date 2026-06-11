@@ -33,7 +33,7 @@ import torch
 from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
 from tokenspeed_kernel.ops.norm.triton import dual_rmsnorm
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.xkernels.ops.norm.reference import (
+from xkernels.ops.norm.reference import (
     dual_rmsnorm_ref,
 )
 

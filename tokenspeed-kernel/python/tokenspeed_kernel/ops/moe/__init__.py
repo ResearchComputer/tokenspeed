@@ -42,6 +42,18 @@ except Exception:  # pragma: no cover - vendored/triton import optional
     logging.getLogger(__name__).debug(
         "xkernels INT4 MoE backend not registered", exc_info=True
     )
+
+# Opt-in AMD moe/dispatch backend: sync-free / fixed-shape Triton moe_align
+# (xkernels, kernels#18, truncate=False), HIP-graph-capturable. Registered above
+# the in-tree torch amd_moe_align_block_size ONLY when TS_XKERNELS_ALIGN=1
+# (validated correct + graph-stable; not default-ON yet — see xkernels_align.py).
+# Guarded so an xkernels-import issue never breaks the core moe ops registration.
+try:
+    import tokenspeed_kernel.ops.moe.xkernels_align  # noqa: F401
+except Exception:  # pragma: no cover - vendored/triton import optional
+    logging.getLogger(__name__).debug(
+        "xkernels moe_align backend not registered", exc_info=True
+    )
 import torch
 from tokenspeed_kernel.ops.moe.expert_location_dispatch import (  # noqa: F401
     ExpertLocationDispatchInfo,

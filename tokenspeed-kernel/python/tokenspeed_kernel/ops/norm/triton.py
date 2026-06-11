@@ -18,14 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused dual RMSNorm (norm.dual_rmsnorm) backed by vendored ``xkernels``.
+"""Fused dual RMSNorm (norm.dual_rmsnorm) backed by ``xkernels``.
 
 This normalizes the two MLA latents (``q_a`` / ``kv_a``) in a single Triton
 launch instead of two sequential RMSNorm launches. The math comes from the
-vendored ``xkernels`` kernel (``thirdparty/xkernels/ops/norm/triton``); this
+``xkernels`` kernel (``xkernels/ops/norm/triton``); this
 module is the thin tokenspeed-side launcher + registry registration.
 
-The vendored ``@triton.jit`` kernel is imported through the third-party
+The ``@triton.jit`` kernel is imported through the third-party
 boundary, which routes the import through ``tokenspeed_kernel._triton`` so the
 kernel binds the ``tokenspeed_triton`` package (not stock ``triton``) — required
 for the kernel to compile/run inside the tokenspeed serving process.
@@ -39,12 +39,13 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-# Importing the vendored norm package registers the xkernels backends and, as a
-# side effect, imports its ``@triton.jit`` kernel under the tokenspeed_triton
-# redirect (see thirdparty/xkernels/ops/norm/__init__.py). We then reach in for
-# the compiled-kernel symbol so we can launch it into caller-provided output
-# buffers (the vendored launcher always allocates fresh outputs).
-from tokenspeed_kernel.thirdparty.xkernels.ops.norm.triton.dual_rmsnorm_kernel import (
+# Importing the xkernels norm package registers its backends and, as a side
+# effect, imports its ``@triton.jit`` kernel under the tokenspeed_triton redirect
+# (xkernels' ops/norm/__init__.py routes the import through its _triton_compat
+# hook). We then reach in for the compiled-kernel symbol so we can launch it into
+# caller-provided output buffers (the upstream launcher always allocates fresh
+# outputs).
+from xkernels.ops.norm.triton.dual_rmsnorm_kernel import (
     dual_rmsnorm_kernel as _xkernels_dual_rmsnorm_kernel,
 )
 

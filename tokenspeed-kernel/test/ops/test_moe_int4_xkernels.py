@@ -46,10 +46,10 @@ from tokenspeed_kernel._triton import tl  # noqa: E402
 from tokenspeed_kernel.ops.moe.xkernels import (  # noqa: E402
     invoke_xkernels_moe_int4_w4a16,
 )
-from tokenspeed_kernel.thirdparty.xkernels.ops.moe.reference import (  # noqa: E402
+from xkernels.ops.moe.reference import (  # noqa: E402
     moe_w4a16_ref,
 )
-from tokenspeed_kernel.thirdparty.xkernels.ops.moe.w4a16 import (  # noqa: E402
+from xkernels.ops.moe.w4a16 import (  # noqa: E402
     make_w4a16_weights,
 )
 
