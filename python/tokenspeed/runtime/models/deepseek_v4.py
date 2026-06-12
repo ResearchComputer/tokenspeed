@@ -43,6 +43,25 @@ try:
 except ImportError:
     deep_gemm = None  # type: ignore[assignment]
 
+try:
+    # Portable AMD (gfx942) DSA-indexer ops. DeepSeek-V4's indexer logits +
+    # top-k are NVIDIA-only (`deep_gemm` + trtllm); on AMD these `xkernels` ops
+    # (ResearchComputer/kernels #27/#28) compute the same weighted-ReLU MQA
+    # selection from dequantized bf16 queries/keys. See
+    # `_deepseek_v4_amd_indexer_enabled`.
+    from xkernels import dsa_indexer_logits as _xk_dsa_indexer_logits
+    from xkernels import dsa_indexer_topk as _xk_dsa_indexer_topk
+    from xkernels import mxfp4_paged_gather as _xk_mxfp4_paged_gather
+    from xkernels.ops.gather.mxfp4 import dequant_mxfp4 as _xk_dequant_mxfp4
+
+    _XK_INDEXER_AVAILABLE = True
+except Exception:  # pragma: no cover - xkernels optional on NVIDIA builds
+    _xk_dsa_indexer_logits = None  # type: ignore[assignment]
+    _xk_dsa_indexer_topk = None  # type: ignore[assignment]
+    _xk_mxfp4_paged_gather = None  # type: ignore[assignment]
+    _xk_dequant_mxfp4 = None  # type: ignore[assignment]
+    _XK_INDEXER_AVAILABLE = False
+
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
@@ -513,6 +532,217 @@ def _deepseek_v4_indexer_mxfp4_cache_view(
         (cache_2d.shape[0], block_size, 1, row_bytes),
         (cache_2d.stride(0), row_bytes, row_bytes, 1),
     )
+
+
+# ---------------------------------------------------------------------------
+# AMD (gfx942) DSA indexer path.
+#
+# DeepSeek-V4's indexer logits + top-k are NVIDIA-only (``deep_gemm`` + trtllm).
+# On AMD ``deep_gemm`` is unavailable, so the indexer is computed with the
+# portable ``xkernels`` ops (ResearchComputer/kernels #27/#28): the mxfp4 indexer
+# cache + queries are dequantized to bf16, ``dsa_indexer_logits`` computes the
+# weighted-ReLU MQA scores ``sum_h w[t,h]*relu(q[t,h]·k[j])`` over the causal
+# window ``[row_starts, row_starts+lengths)``, and ``dsa_indexer_topk`` selects
+# the survivors. The dot-product is invariant to the mxfp4 nibble order (queries
+# and keys share one packer), so dequantized-math reproduces the selection that
+# the fp8/fp4 ``deep_gemm`` kernels make. Correctness-first: the per-sequence
+# gather/score loop is not bandwidth-optimized.
+# ---------------------------------------------------------------------------
+
+
+def _deepseek_v4_amd_indexer_enabled() -> bool:
+    """True when the DSA indexer must use the portable AMD (gfx942) path."""
+    return _XK_INDEXER_AVAILABLE and deep_gemm is None and _platform.is_amd
+
+
+def _deepseek_v4_amd_dequant_mxfp4(
+    values: torch.Tensor, scales: torch.Tensor, head_dim: int
+) -> torch.Tensor:
+    """Dequantize packed mxfp4 rows to fp32 ``[N, head_dim]`` (N = prod of lead dims).
+
+    ``values`` packs two E2M1 nibbles per byte (last dim ``head_dim // 2``);
+    ``scales`` holds one E8M0 byte per ``DEEPSEEK_V4_MXFP4_BLOCK_SIZE`` group.
+    Accepts uint8 or int-packed scale tensors (reinterpreted to uint8).
+    """
+    half = head_dim // 2
+    n_grp = head_dim // DEEPSEEK_V4_MXFP4_BLOCK_SIZE
+    v = values.contiguous().view(torch.uint8).reshape(-1, half)
+    s = scales.contiguous().view(torch.uint8).reshape(-1, n_grp)
+    return _xk_dequant_mxfp4(v, s, DEEPSEEK_V4_MXFP4_BLOCK_SIZE)
+
+
+def _deepseek_v4_amd_split_indexer_cache(
+    cache_2d: torch.Tensor, block_size: int
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Split the paged mxfp4 indexer cache for :func:`xkernels.mxfp4_paged_gather`.
+
+    Returns ``(kv_packed [num_blocks, block_size, head_dim//2], kv_scale
+    [num_blocks, block_size, head_dim//group], head_dim)``. The cache stores each
+    KV row as ``value_bytes`` E2M1 bytes followed by ``scale_bytes`` E8M0 bytes.
+    """
+    row_bytes = cache_2d.shape[1] // block_size
+    head_dim, value_bytes, scale_bytes = (
+        deepseek_v4_indexer_mxfp4_layout_from_row_bytes(row_bytes)
+    )
+    cache_3d = cache_2d.view(cache_2d.shape[0], block_size, row_bytes)
+    kv_packed = cache_3d[:, :, :value_bytes]
+    kv_scale = cache_3d[:, :, value_bytes : value_bytes + scale_bytes]
+    return kv_packed, kv_scale, head_dim
+
+
+def _deepseek_v4_indexer_topk_prefill_amd(
+    *,
+    cache_2d: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    cu_start: torch.Tensor,
+    row_lens: torch.Tensor,
+    max_len: int,
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cache_block_size: int,
+    topk_tokens: int,
+) -> torch.Tensor:
+    """gfx942 prefill indexer top-k (xkernels), replacing the deep_gemm path.
+
+    Per query token ``t`` the valid KV window in the flattened gathered cache is
+    ``[cu_start[t], cu_start[t]+row_lens[t])``; the returned indices are
+    per-sequence KV positions (window offset removed), ``-1`` padded.
+    """
+    q_values, q_scales = index_q
+    num_tokens = q_values.shape[0]
+    device = q_values.device
+    if num_tokens == 0:
+        return torch.empty((0, topk_tokens), device=device, dtype=torch.int32)
+    cu = cu_seq_lens.to(torch.int64)
+    num_seqs = int(block_table.shape[0])
+    seqlens = (cu[1:] - cu[:-1]).clamp_min(0) if cu.numel() > 1 else cu.new_zeros(0)
+    k_total = int(cu[-1].item()) if cu.numel() else 0
+    max_seq = int(seqlens.max().item()) if seqlens.numel() else 0
+    if max_len <= 0 or k_total == 0 or max_seq == 0:
+        return torch.full(
+            (num_tokens, topk_tokens), -1, device=device, dtype=torch.int32
+        )
+    kv_packed, kv_scale, head_dim = _deepseek_v4_amd_split_indexer_cache(
+        cache_2d, cache_block_size
+    )
+    # Gather + dequantize every cached KV position per sequence, then flatten to
+    # the [k_total, D] layout the per-query windows index into.
+    pos = torch.arange(max_seq, device=device)
+    sel = torch.where(
+        pos[None, :] < seqlens[:, None],
+        pos[None, :].expand(num_seqs, max_seq),
+        torch.full((num_seqs, max_seq), -1, device=device, dtype=torch.int64),
+    )
+    gathered = _xk_mxfp4_paged_gather(
+        kv_packed,
+        kv_scale,
+        block_table,
+        sel.to(torch.int32),
+        block_size=cache_block_size,
+        group_size=DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+        out_dtype=torch.bfloat16,
+    )
+    k_flat = gathered.new_zeros((k_total, head_dim))
+    for s in range(num_seqs):
+        seq_len = int(seqlens[s].item())
+        if seq_len > 0:
+            base = int(cu[s].item())
+            k_flat[base : base + seq_len] = gathered[s, :seq_len]
+    q_bf16 = (
+        _deepseek_v4_amd_dequant_mxfp4(q_values, q_scales, head_dim)
+        .reshape(num_tokens, q_values.shape[1], head_dim)
+        .to(torch.bfloat16)
+    )
+    logits = _xk_dsa_indexer_logits(
+        q_bf16,
+        k_flat,
+        weights.float(),
+        lengths=row_lens.to(torch.int32),
+        row_starts=cu_start.to(torch.int32),
+    )
+    kk = min(topk_tokens, int(logits.shape[1]))
+    topk = torch.full((num_tokens, topk_tokens), -1, device=device, dtype=torch.int32)
+    if kk > 0:
+        idx = _xk_dsa_indexer_topk(logits, kk).to(torch.int64)
+        sel_logit = logits.gather(1, idx)
+        rel = idx - cu_start.to(torch.int64)[:, None]
+        rel = torch.where(torch.isfinite(sel_logit), rel, torch.full_like(rel, -1))
+        topk[:, :kk] = rel.to(torch.int32)
+    return topk
+
+
+def _deepseek_v4_indexer_topk_decode_amd(
+    *,
+    cache_2d: torch.Tensor,
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cache_block_size: int,
+    topk_tokens: int,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_len: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """gfx942 decode indexer top-k (xkernels), replacing the deep_gemm path.
+
+    Each decode token attends to its own sequence's ``[0, context_lens[t])`` KV;
+    returned indices are per-sequence KV positions, ``-1`` padded.
+    """
+    q_values, q_scales = index_q
+    num_tokens = q_values.shape[0]
+    device = q_values.device
+    topk = (
+        out[:num_tokens]
+        if out is not None
+        else torch.empty((num_tokens, topk_tokens), device=device, dtype=torch.int32)
+    )
+    if num_tokens == 0:
+        return topk
+    topk.fill_(-1)
+    if max_len <= 0:
+        return topk
+    kv_packed, kv_scale, head_dim = _deepseek_v4_amd_split_indexer_cache(
+        cache_2d, cache_block_size
+    )
+    ctx = context_lens.to(torch.int64).reshape(-1)
+    pos = torch.arange(max_len, device=device)
+    sel = torch.where(
+        pos[None, :] < ctx[:, None],
+        pos[None, :].expand(num_tokens, max_len),
+        torch.full((num_tokens, max_len), -1, device=device, dtype=torch.int64),
+    )
+    gathered = _xk_mxfp4_paged_gather(
+        kv_packed,
+        kv_scale,
+        block_tables,
+        sel.to(torch.int32),
+        block_size=cache_block_size,
+        group_size=DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+        out_dtype=torch.bfloat16,
+    )
+    n_heads = q_values.shape[1]
+    q_bf16 = (
+        _deepseek_v4_amd_dequant_mxfp4(q_values, q_scales, head_dim)
+        .reshape(num_tokens, n_heads, head_dim)
+        .to(torch.bfloat16)
+    )
+    w = weights.float()
+    if w.dim() == 3:
+        w = w.squeeze(-1)
+    for t in range(num_tokens):
+        seq_len = int(ctx[t].item())
+        if seq_len <= 0:
+            continue
+        logit = _xk_dsa_indexer_logits(
+            q_bf16[t : t + 1], gathered[t, :seq_len], w[t : t + 1]
+        )
+        kk = min(topk_tokens, seq_len)
+        idx = _xk_dsa_indexer_topk(logit, kk)[0].to(torch.int64)
+        sel_logit = logit[0].gather(0, idx)
+        idx = torch.where(torch.isfinite(sel_logit), idx, torch.full_like(idx, -1))
+        topk[t, :kk] = idx.to(torch.int32)
+    return topk
 
 
 def _deepseek_v4_gather_paged_indexer_mxfp4_cache(
@@ -1353,6 +1583,22 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     gather_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
     q_values, q_scales = index_q
+    if _deepseek_v4_amd_indexer_enabled():
+        return (
+            _deepseek_v4_indexer_topk_prefill_amd(
+                cache_2d=cache_2d,
+                block_table=block_table,
+                cu_seq_lens=cu_seq_lens,
+                cu_start=cu_start,
+                row_lens=row_lens,
+                max_len=max_len,
+                index_q=index_q,
+                weights=weights,
+                cache_block_size=cache_block_size,
+                topk_tokens=topk_tokens,
+            ),
+            gathered_k,
+        )
     if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
         raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM FP4 support")
 
@@ -1433,7 +1679,8 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
     persistent_topk_workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     q_values, q_scales = index_q
-    if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
+    _amd_indexer = _deepseek_v4_amd_indexer_enabled()
+    if not _amd_indexer and not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
         raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM FP4 support")
 
     num_tokens = positions.numel()
@@ -1462,6 +1709,18 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
         context_lens = decode_plan.context_lens
         block_tables = decode_plan.block_table
         max_len = decode_plan.max_context_len
+    if _amd_indexer:
+        return _deepseek_v4_indexer_topk_decode_amd(
+            cache_2d=cache_2d,
+            index_q=index_q,
+            weights=weights,
+            cache_block_size=cache_block_size,
+            topk_tokens=topk_tokens,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            max_len=max_len,
+            out=out,
+        )
     topk = (
         torch.empty(
             (num_tokens, topk_tokens),
@@ -3133,7 +3392,7 @@ class DeepseekV4Indexer(nn.Module):
         packed_indexer_available = _deepseek_v4_deepgemm_fp4_indexer_available(
             packed_index_q[0]
         )
-        if not packed_indexer_available:
+        if not packed_indexer_available and not _deepseek_v4_amd_indexer_enabled():
             raise RuntimeError(
                 "DeepSeek V4 sparse indexer requires DeepGEMM FP4 support"
             )
@@ -3594,6 +3853,33 @@ class DeepseekV4Attention(nn.Module):
             rope_dim=self.qk_rope_head_dim,
             tma_aligned_scales=self._o_tma_aligned,
         )
+        if getattr(self.wo_a, "_bmm_amd_bf16", False):
+            # AMD (gfx942): no deep_gemm fp8_einsum. Dequantize the FP8
+            # block-scaled o activations to bf16 and run the grouped output
+            # projection as a bf16 einsum against the bf16 wo_a weight
+            # (dequantized once at load). Equivalent up to fp8 rounding.
+            b_sz, n_grp, o_in_dim = o_fp8.shape
+            n_blk = o_scale.shape[-1]
+            blk = o_in_dim // n_blk
+            o_scale_f = (
+                o_scale.float()
+                if o_scale.is_floating_point()
+                else torch.exp2(o_scale.float() - 127.0)
+            )
+            o_bf16 = (
+                (
+                    o_fp8.float().reshape(b_sz, n_grp, n_blk, blk)
+                    * o_scale_f.reshape(b_sz, n_grp, n_blk, 1)
+                )
+                .reshape(b_sz, n_grp, o_in_dim)
+                .to(torch.bfloat16)
+            )
+            weight_bf16 = self.wo_a.weight_bf16.reshape(
+                self.num_local_groups, self.o_lora_rank, o_in_dim
+            )
+            z = torch.einsum("bhr,hdr->bhd", o_bf16, weight_bf16).to(torch.bfloat16)
+            out, _ = self.wo_b(z.flatten(1))
+            return out
         in_dim = self.num_heads * self.head_dim // self.o_groups
         weight = self.wo_a.weight.view(self.num_local_groups, self.o_lora_rank, in_dim)
         block_n, block_k = self.wo_a._deep_gemm_block_size

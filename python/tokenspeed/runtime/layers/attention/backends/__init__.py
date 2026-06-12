@@ -61,3 +61,13 @@ from tokenspeed.runtime.layers.attention.backends import mla  # noqa: F401
 if platform.is_amd:
     # AITER MLA backend (DeepSeek-V3 / Kimi-style models on CDNA3/CDNA4).
     _try_import_optional_backend("aiter_mla", "aiter")
+    # DeepSeek-V4 sparse-attention backend on gfx942. Registering it makes the
+    # AMD DSA-indexer path (xkernels logits/top-k + paged gather) and the bf16
+    # o_proj fallback reachable. NOTE: the sparse-attention *compute* still needs
+    # gfx942 kernels -- flash_mla_sparse_fwd / flash_mla_with_kvcache are
+    # NVIDIA-Hopper+ only (DeepSeek FlashMLA), so the forward currently raises at
+    # those calls until a CDNA3 sparse-MLA kernel lands. See ResearchComputer
+    # /kernels (V4 sparse-MLA attention tracking issue).
+    from tokenspeed.runtime.layers.attention.backends import (  # noqa: F401
+        deepseek_v4,
+    )
