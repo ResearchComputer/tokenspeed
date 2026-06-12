@@ -6,4 +6,4 @@ tokenspeed-proton>=3.7.10.post20260531
 tokenspeed-triton>=3.7.10.post20260531
 wheel
 psutil
-xkernels @ git+https://github.com/ResearchComputer/kernels@6b94a732cd0fa69b3ada91de33959eb047fd491c
+xkernels @ git+https://github.com/ResearchComputer/kernels@f36a72fab595e5e25d0e5ec8e2486a57a09c85d2

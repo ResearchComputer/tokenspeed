@@ -24,6 +24,7 @@ from tokenspeed_kernel.ops.attention.flash_mla import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
 try:
@@ -972,6 +973,49 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             ),
         )
 
+    @staticmethod
+    def _fp8_ds_mla_value_scale_views(
+        cache_2d: torch.Tensor,
+        block_size: int,
+        token_stride: int,
+        scale_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split a paged fp8_ds_mla pool buffer into separate value/scale views
+        for the xkernels Triton decode kernel.
+
+        The per-block byte layout (written by ``_move_fp8_ds_mla_rows`` /
+        ``_deepseek_v4_fused_sparse_compress_cache_kernel``) is
+        ``[block_size*token_stride value bytes | block_size*scale_dim scale bytes
+        | alignment pad]``. Unlike :meth:`_fp8_ds_mla_cache_view` (a per-token row
+        view the NVIDIA asm kernel reinterprets internally), the Triton kernel
+        indexes these tensors directly, so the value/scale regions must be exposed
+        with their true block-grouped strides.
+
+        Args:
+            cache_2d: ``[num_blocks, block_bytes]`` uint8 pool buffer.
+            block_size: tokens per block.
+            token_stride: value-region bytes per token (nope fp8 + rope bf16).
+            scale_dim: scale-region bytes per token.
+
+        Returns:
+            ``(value [num_blocks, block_size, token_stride],
+            scale [num_blocks, block_size, scale_dim])`` zero-copy strided views.
+        """
+        num_blocks = cache_2d.shape[0]
+        block_stride = cache_2d.stride(0)
+        base = cache_2d.storage_offset()
+        value = cache_2d.as_strided(
+            (num_blocks, block_size, token_stride),
+            (block_stride, token_stride, 1),
+            base,
+        )
+        scale = cache_2d.as_strided(
+            (num_blocks, block_size, scale_dim),
+            (block_stride, scale_dim, 1),
+            base + block_size * token_stride,
+        )
+        return value, scale
+
     def forward_deepseek_v4_decode(
         self,
         *,
@@ -1043,16 +1087,43 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             topk_indices=topk_indices,
         )
 
-        swa_cache = self._fp8_ds_mla_cache_view(
-            token_to_kv_pool.get_swa_kv_buffer(layer_id),
-            swa_block_size,
-        )
-        compressed_cache = None
-        if compress_ratio > 1:
-            compressed_cache = self._fp8_ds_mla_cache_view(
-                token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
-                compressed_block_size,
+        if current_platform().is_amd:
+            # gfx942: the xkernels Triton sparse-MLA decode kernel gathers from the
+            # paged fp8_ds_mla cache split into value/scale views (the pool block
+            # layout is ``[block_size*token_stride values | block_size*scale_dim
+            # scales | pad]``) using the **physical** ``indices`` (block_table=None).
+            layout = token_to_kv_pool.layout
+            swa_cache, swa_scale = self._fp8_ds_mla_value_scale_views(
+                token_to_kv_pool.get_swa_kv_buffer(layer_id),
+                swa_block_size,
+                layout.swa_token_stride,
+                layout.swa_scale_dim,
             )
+            compressed_cache = compressed_scale = None
+            if compress_ratio > 1:
+                compressed_cache, compressed_scale = self._fp8_ds_mla_value_scale_views(
+                    token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
+                    compressed_block_size,
+                    layout.swa_token_stride,
+                    layout.swa_scale_dim,
+                )
+            extra_cache_kwargs = dict(
+                scale_cache=swa_scale,
+                extra_scale_cache=compressed_scale,
+                block_size=swa_block_size,
+            )
+        else:
+            swa_cache = self._fp8_ds_mla_cache_view(
+                token_to_kv_pool.get_swa_kv_buffer(layer_id),
+                swa_block_size,
+            )
+            compressed_cache = None
+            if compress_ratio > 1:
+                compressed_cache = self._fp8_ds_mla_cache_view(
+                    token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
+                    compressed_block_size,
+                )
+            extra_cache_kwargs = {}
 
         out, _ = flash_mla_with_kvcache(
             q=q_padded.unsqueeze(1),
@@ -1072,6 +1143,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             extra_indices_in_kvcache=extra_indices,
             topk_length=swa_lens,
             extra_topk_length=extra_lens,
+            **extra_cache_kwargs,
         )
         if out.dim() == 4:
             out = out.squeeze(1)

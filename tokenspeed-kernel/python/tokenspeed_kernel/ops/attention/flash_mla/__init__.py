@@ -36,6 +36,19 @@ if platform.is_nvidia and platform.is_hopper_plus:
         )
     except ImportError:
         pass
+elif platform.is_amd:
+    # gfx942 (CDNA3): portable Triton sparse-MLA compute from xkernels
+    # (ResearchComputer/kernels#32/#33) replaces the NVIDIA-only DeepSeek
+    # ``flash_mla`` kernels. The xkernels wrappers are exposed under these
+    # upstream-faithful names so the DeepSeek-V4 backend binds them drop-in.
+    try:
+        from xkernels import (
+            flash_mla_sparse_fwd,
+            flash_mla_with_kvcache,
+            get_mla_metadata,
+        )
+    except ImportError:
+        pass
 
 # ------------------------------------------------------------------------------
 # Direct export
